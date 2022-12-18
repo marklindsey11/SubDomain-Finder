@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -46,7 +47,11 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 			close(results)
 		}(time.Now())
 
-		resp, err := session.SimpleGet(ctx, indexURL)
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet,
+			URL:    indexURL,
+			Source: "commoncrawl",
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++
@@ -128,7 +133,12 @@ func (s *Source) getSubdomains(ctx context.Context, searchURL, domain string, se
 			return false
 		default:
 			var headers = map[string]string{"Host": "index.commoncrawl.org"}
-			resp, err := session.Get(ctx, fmt.Sprintf("%s?url=*.%s", searchURL, domain), "", headers)
+			resp, err := session.Do(ctx, &subscraping.Options{
+				Method:  http.MethodGet,
+				URL:     fmt.Sprintf("%s?url=*.%s", searchURL, domain),
+				Headers: headers,
+				Source:  "commoncrawl",
+			})
 			if err != nil {
 				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 				session.DiscardHTTPResponse(resp)

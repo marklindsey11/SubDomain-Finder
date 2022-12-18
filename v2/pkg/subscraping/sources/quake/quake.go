@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -59,9 +60,16 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 
 		// quake api doc https://quake.360.cn/quake/#/help
 		var requestBody = []byte(fmt.Sprintf(`{"query":"domain: *.%s", "start":0, "size":500}`, domain))
-		resp, err := session.Post(ctx, "https://quake.360.cn/api/v3/search/quake_service", "", map[string]string{
-			"Content-Type": "application/json", "X-QuakeToken": randomApiKey,
-		}, bytes.NewReader(requestBody))
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodPost,
+			URL:    "https://quake.360.cn/api/v3/search/quake_service",
+			Headers: map[string]string{
+				"Content-Type": "application/json", "X-QuakeToken": randomApiKey,
+			},
+			Body:   bytes.NewReader(requestBody),
+			Source: "quake",
+			UID:    randomApiKey,
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++

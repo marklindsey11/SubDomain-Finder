@@ -110,7 +110,7 @@ func ParseOptions() *Options {
 	)
 
 	createGroup(flagSet, "rate-limit", "Rate-limit",
-		flagSet.IntVarP(&options.RateLimit, "rate-limit", "rl", 0, "maximum number of http requests to send per second"),
+		flagSet.IntVarP(&options.RateLimit, "rate-limit-minute", "rlm", 0, "max number of http request sent to unknown ratelimit sources per minute"),
 		flagSet.IntVar(&options.Threads, "t", 10, "number of concurrent goroutines for resolving (-active only)"),
 	)
 

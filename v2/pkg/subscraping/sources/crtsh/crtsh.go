@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -122,7 +123,11 @@ func (s *Source) getSubdomainsFromSQL(domain string, session *subscraping.Sessio
 }
 
 func (s *Source) getSubdomainsFromHTTP(ctx context.Context, domain string, session *subscraping.Session, results chan subscraping.Result) bool {
-	resp, err := session.SimpleGet(ctx, fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain))
+	resp, err := session.Do(ctx, &subscraping.Options{
+		Method: http.MethodGet,
+		URL:    fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain),
+		Source: "crtsh",
+	})
 	if err != nil {
 		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 		s.errors++

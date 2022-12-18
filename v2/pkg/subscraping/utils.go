@@ -1,6 +1,9 @@
 package subscraping
 
 import (
+	"crypto/sha256"
+	"fmt"
+	"hash"
 	"math/rand"
 	"regexp"
 	"strings"
@@ -13,9 +16,15 @@ import (
 const MultipleKeyPartsLength = 2
 
 var subdomainExtractorMutex = &sync.Mutex{}
+var sha hash.Hash = sha256.New()
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
+}
+
+func HashID(x any) string {
+	mystr := fmt.Sprintf("%v", x)
+	return fmt.Sprintf("%v", sha.Sum([]byte(mystr)))
 }
 
 // NewSubdomainExtractor creates a new regular expression to extract

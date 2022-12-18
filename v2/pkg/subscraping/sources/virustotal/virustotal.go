@@ -4,6 +4,7 @@ package virustotal
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -41,7 +42,13 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 			return
 		}
 
-		resp, err := session.SimpleGet(ctx, fmt.Sprintf("https://www.virustotal.com/vtapi/v2/domain/report?apikey=%s&domain=%s", randomApiKey, domain))
+		// v2 api ratelimit 204 status code with empty body
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet,
+			URL:    fmt.Sprintf("https://www.virustotal.com/vtapi/v2/domain/report?apikey=%s&domain=%s", randomApiKey, domain),
+			Source: "virustotal",
+			UID:    randomApiKey,
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++

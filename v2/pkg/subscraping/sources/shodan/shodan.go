@@ -4,6 +4,7 @@ package shodan
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -46,7 +47,12 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 		}
 
 		searchURL := fmt.Sprintf("https://api.shodan.io/dns/domain/%s?key=%s", domain, randomApiKey)
-		resp, err := session.SimpleGet(ctx, searchURL)
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet,
+			URL:    searchURL,
+			Source: "shodan",
+			UID:    randomApiKey,
+		})
 		if err != nil {
 			session.DiscardHTTPResponse(resp)
 			return

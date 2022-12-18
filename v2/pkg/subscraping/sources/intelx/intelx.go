@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -84,8 +85,14 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 			s.errors++
 			return
 		}
-
-		resp, err := session.SimplePost(ctx, searchURL, "application/json", bytes.NewBuffer(body))
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method:      http.MethodPost,
+			URL:         searchURL,
+			ContentType: "application/json",
+			Body:        bytes.NewBuffer(body),
+			Source:      "intelx",
+			UID:         randomApiKey.key,
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++
@@ -107,7 +114,12 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 		resultsURL := fmt.Sprintf("https://%s/phonebook/search/result?k=%s&id=%s&limit=10000", randomApiKey.host, randomApiKey.key, response.ID)
 		status := 0
 		for status == 0 || status == 3 {
-			resp, err = session.Get(ctx, resultsURL, "", nil)
+			resp, err = session.Do(ctx, &subscraping.Options{
+				Method: http.MethodGet,
+				URL:    resultsURL,
+				Source: "intelx",
+				UID:    randomApiKey.key,
+			})
 			if err != nil {
 				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 				s.errors++

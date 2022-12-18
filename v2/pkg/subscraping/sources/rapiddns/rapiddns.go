@@ -4,6 +4,7 @@ package rapiddns
 import (
 	"context"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
@@ -28,7 +29,11 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 			close(results)
 		}(time.Now())
 
-		resp, err := session.SimpleGet(ctx, "https://rapiddns.io/subdomain/"+domain+"?full=1")
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet,
+			URL:    "https://rapiddns.io/subdomain/" + domain + "?full=1",
+			Source: "rapiddns",
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++

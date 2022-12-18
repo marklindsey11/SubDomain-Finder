@@ -4,6 +4,7 @@ package censys
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -62,16 +63,15 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 		for {
 			var request = []byte(`{"query":"` + domain + `", "page":` + strconv.Itoa(currentPage) + `, "fields":["parsed.names","parsed.extensions.subject_alt_name.dns_names"], "flatten":true}`)
 
-			resp, err := session.HTTPRequest(
-				ctx,
-				"POST",
-				"https://search.censys.io/api/v1/search/certificates",
-				"",
-				map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
-				bytes.NewReader(request),
-				subscraping.BasicAuth{Username: randomApiKey.token, Password: randomApiKey.secret},
-			)
-
+			resp, err := session.Do(ctx, &subscraping.Options{
+				Method:    http.MethodPost,
+				URL:       "https://search.censys.io/api/v1/search/certificates",
+				Headers:   map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
+				Body:      bytes.NewReader(request),
+				BasicAuth: subscraping.BasicAuth{Username: randomApiKey.token, Password: randomApiKey.secret},
+				Source:    "censys",
+				UID:       randomApiKey.token,
+			})
 			if err != nil {
 				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 				s.errors++

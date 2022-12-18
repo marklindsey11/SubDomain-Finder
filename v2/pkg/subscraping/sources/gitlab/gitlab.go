@@ -18,7 +18,11 @@ import (
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys []string
+	apiKeys   []string
+	timeTaken time.Duration
+	errors    int
+	results   int
+	skipped   bool
 }
 
 type item struct {
@@ -31,9 +35,14 @@ type item struct {
 // Run function returns all subdomains found with the service
 func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
 	results := make(chan subscraping.Result)
+	s.errors = 0
+	s.results = 0
 
 	go func() {
-		defer close(results)
+		defer func(startTime time.Time) {
+			s.timeTaken = time.Since(startTime)
+			close(results)
+		}(time.Now())
 
 		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
 		if randomApiKey == "" {
@@ -57,7 +66,13 @@ func (s *Source) enumerate(ctx context.Context, searchURL string, domainRegexp *
 	default:
 	}
 
-	resp, err := session.Get(ctx, searchURL, "", headers)
+	resp, err := session.Do(ctx, &subscraping.Options{
+		Method:  http.MethodGet,
+		URL:     searchURL,
+		Headers: headers,
+		Source:  "gitlab",
+		UID:     subscraping.HashID(headers),
+	})
 	if err != nil && resp == nil {
 		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 		session.DiscardHTTPResponse(resp)
@@ -80,7 +95,13 @@ func (s *Source) enumerate(ctx context.Context, searchURL string, domainRegexp *
 		go func(item item) {
 			// The original item.Path causes 404 error because the Gitlab API is expecting the url encoded path
 			fileUrl := fmt.Sprintf("https://gitlab.com/api/v4/projects/%d/repository/files/%s/raw?ref=%s", item.ProjectId, url.QueryEscape(item.Path), item.Ref)
-			resp, err := session.Get(ctx, fileUrl, "", headers)
+			resp, err := session.Do(ctx, &subscraping.Options{
+				Method:  http.MethodGet,
+				URL:     fileUrl,
+				Headers: headers,
+				Source:  "gitlab",
+				UID:     subscraping.HashID(headers),
+			})
 			if err != nil {
 				if resp == nil || (resp != nil && resp.StatusCode != http.StatusNotFound) {
 					session.DiscardHTTPResponse(resp)
@@ -117,10 +138,6 @@ func (s *Source) enumerate(ctx context.Context, searchURL string, domainRegexp *
 				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 				return
 			}
-
-			// TODO: hardcoded for testing, should be a source internal rate limit #718
-			time.Sleep(2 * time.Second)
-
 			s.enumerate(ctx, nextURL, domainRegexp, headers, session, results)
 		}
 	}
@@ -152,4 +169,13 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(keys []string) {
 	s.apiKeys = keys
+}
+
+func (s *Source) Statistics() subscraping.Statistics {
+	return subscraping.Statistics{
+		Errors:    s.errors,
+		Results:   s.results,
+		TimeTaken: s.timeTaken,
+		Skipped:   s.skipped,
+	}
 }

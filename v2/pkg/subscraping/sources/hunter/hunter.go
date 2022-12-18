@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -60,7 +61,12 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 		for currentPage := 1; currentPage <= pages; currentPage++ {
 			// hunter api doc https://hunter.qianxin.com/home/helpCenter?r=5-1-2
 			qbase64 := base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("domain=\"%s\"", domain)))
-			resp, err := session.SimpleGet(ctx, fmt.Sprintf("https://hunter.qianxin.com/openApi/search?api-key=%s&search=%s&page=1&page_size=100&is_web=3", randomApiKey, qbase64))
+			resp, err := session.Do(ctx, &subscraping.Options{
+				Method: http.MethodGet,
+				URL:    fmt.Sprintf("https://hunter.qianxin.com/openApi/search?api-key=%s&search=%s&page=1&page_size=100&is_web=3", randomApiKey, qbase64),
+				Source: "hunter",
+				UID:    randomApiKey,
+			})
 			if err != nil && resp == nil {
 				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 				s.errors++

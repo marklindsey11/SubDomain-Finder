@@ -4,6 +4,7 @@ package whoisxmlapi
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -54,7 +55,12 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 			return
 		}
 
-		resp, err := session.SimpleGet(ctx, fmt.Sprintf("https://subdomains.whoisxmlapi.com/api/v1?apiKey=%s&domainName=%s", randomApiKey, domain))
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet,
+			URL:    fmt.Sprintf("https://subdomains.whoisxmlapi.com/api/v1?apiKey=%s&domainName=%s", randomApiKey, domain),
+			Source: "whoisxmlapi",
+			UID:    randomApiKey,
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++

@@ -58,8 +58,8 @@ type Session struct {
 	Extractor *regexp.Regexp
 	// Client is the current http client
 	Client *http.Client
-	// Rate limit instance
-	RateLimiter *ratelimit.Limiter
+	// Rate limit per source
+	RateLimiter *ratelimit.MultiLimiter
 }
 
 // Result is a result structure returned by a source

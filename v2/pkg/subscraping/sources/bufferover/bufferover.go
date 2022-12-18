@@ -4,6 +4,7 @@ package bufferover
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -55,8 +56,13 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 }
 
 func (s *Source) getData(ctx context.Context, sourceURL string, apiKey string, session *subscraping.Session, results chan subscraping.Result) {
-	resp, err := session.Get(ctx, sourceURL, "", map[string]string{"x-api-key": apiKey})
-
+	resp, err := session.Do(ctx, &subscraping.Options{
+		Method:  http.MethodGet,
+		URL:     sourceURL,
+		Headers: map[string]string{"x-api-key": apiKey},
+		Source:  "bufferover",
+		UID:     apiKey,
+	})
 	if err != nil && resp == nil {
 		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 		s.errors++

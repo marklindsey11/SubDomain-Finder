@@ -32,7 +32,11 @@ func (a *agent) enumerate(ctx context.Context, baseURL string) {
 	default:
 	}
 
-	resp, err := a.session.SimpleGet(ctx, baseURL)
+	resp, err := a.session.Do(ctx, &subscraping.Options{
+		Method: http.MethodGet,
+		URL:    baseURL,
+		Source: "sitedossier",
+	})
 	isnotfound := resp != nil && resp.StatusCode == http.StatusNotFound
 	if err != nil && !isnotfound {
 		a.results <- subscraping.Result{Source: "sitedossier", Type: subscraping.Error, Error: err}

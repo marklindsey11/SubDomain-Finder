@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -34,19 +35,19 @@ func postForm(ctx context.Context, session *subscraping.Session, token, domain s
 		"user":                {"free"},
 	}
 
-	resp, err := session.HTTPRequest(
-		ctx,
-		"POST",
-		"https://dnsdumpster.com/",
-		fmt.Sprintf("csrftoken=%s; Domain=dnsdumpster.com", token),
-		map[string]string{
+	resp, err := session.Do(ctx, &subscraping.Options{
+		Method:  http.MethodPost,
+		URL:     "https://dnsdumpster.com/",
+		Cookies: fmt.Sprintf("csrftoken=%s; Domain=dnsdumpster.com", token),
+		Headers: map[string]string{
 			"Content-Type": "application/x-www-form-urlencoded",
 			"Referer":      "https://dnsdumpster.com",
 			"X-CSRF-Token": token,
 		},
-		strings.NewReader(params.Encode()),
-		subscraping.BasicAuth{},
-	)
+		Body:      strings.NewReader(params.Encode()),
+		BasicAuth: subscraping.BasicAuth{},
+		Source:    "dnsdumpster",
+	})
 
 	if err != nil {
 		session.DiscardHTTPResponse(resp)
@@ -78,7 +79,10 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 			close(results)
 		}(time.Now())
 
-		resp, err := session.SimpleGet(ctx, "https://dnsdumpster.com/")
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet,
+			URL:    "https://dnsdumpster.com/",
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++

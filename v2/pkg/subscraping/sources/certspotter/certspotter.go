@@ -4,6 +4,7 @@ package certspotter
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -46,7 +47,14 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 		headers := map[string]string{"Authorization": "Bearer " + randomApiKey}
 		cookies := ""
 
-		resp, err := session.Get(ctx, fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", domain), cookies, headers)
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method:  http.MethodGet,
+			URL:     fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", domain),
+			Cookies: cookies,
+			Headers: headers,
+			UID:     randomApiKey,
+			Source:  "certspotter",
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++
@@ -80,7 +88,14 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 		for {
 			reqURL := fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names&after=%s", domain, id)
 
-			resp, err := session.Get(ctx, reqURL, cookies, headers)
+			resp, err := session.Do(ctx, &subscraping.Options{
+				Method:  http.MethodGet,
+				URL:     reqURL,
+				Cookies: cookies,
+				Headers: headers,
+				UID:     randomApiKey,
+				Source:  "certspotter",
+			})
 			if err != nil {
 				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 				s.errors++

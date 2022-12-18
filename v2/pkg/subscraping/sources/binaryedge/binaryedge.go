@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"strconv"
 	"time"
@@ -100,7 +101,14 @@ func (s *Source) enumerate(ctx context.Context, session *subscraping.Session, ba
 		return
 	}
 
-	resp, err := session.Get(ctx, pageURL.String(), "", authHeader)
+	resp, err := session.Do(ctx, &subscraping.Options{
+		Method:  http.MethodGet,
+		URL:     pageURL.String(),
+		Headers: authHeader,
+		Source:  "binaryedge",
+		UID:     subscraping.HashID(authHeader),
+	})
+
 	if err != nil && resp == nil {
 		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 		s.errors++
@@ -167,14 +175,18 @@ func (s *Source) Statistics() subscraping.Statistics {
 }
 
 func isV2(ctx context.Context, session *subscraping.Session, authHeader map[string]string) bool {
-	resp, err := session.Get(ctx, v2SubscriptionURL, "", authHeader)
+	resp, err := session.Do(ctx, &subscraping.Options{
+		Method:  http.MethodGet,
+		URL:     v2SubscriptionURL,
+		Headers: authHeader,
+		UID:     subscraping.HashID(authHeader),
+		Source:  "binaryedge",
+	})
 	if err != nil {
 		session.DiscardHTTPResponse(resp)
 		return false
 	}
-
 	resp.Body.Close()
-
 	return true
 }
 

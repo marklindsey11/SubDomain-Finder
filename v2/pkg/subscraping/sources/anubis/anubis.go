@@ -4,6 +4,7 @@ package anubis
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -30,7 +31,10 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 			close(results)
 		}(time.Now())
 
-		resp, err := session.SimpleGet(ctx, fmt.Sprintf("https://jonlu.ca/anubis/subdomains/%s", domain))
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet, URL: fmt.Sprintf("https://jonlu.ca/anubis/subdomains/%s", domain),
+			Source: "anubis",
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++

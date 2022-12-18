@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -83,7 +84,13 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 func enumerate(ctx context.Context, session *subscraping.Session, targetURL string, headers map[string]string) ([]result, error) {
 	var results []result
 
-	resp, err := session.Get(ctx, targetURL, "", headers)
+	resp, err := session.Do(ctx, &subscraping.Options{
+		Method:  http.MethodGet,
+		URL:     targetURL,
+		Headers: headers,
+		Source:  "robtex",
+		UID:     subscraping.HashID(headers),
+	})
 	if err != nil {
 		session.DiscardHTTPResponse(resp)
 		return results, err

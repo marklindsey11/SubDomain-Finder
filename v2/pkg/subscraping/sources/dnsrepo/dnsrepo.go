@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -40,7 +41,12 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 			s.skipped = true
 			return
 		}
-		resp, err := session.SimpleGet(ctx, fmt.Sprintf("https://dnsrepo.noc.org/api/?apikey=%s&search=%s", randomApiKey, domain))
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet,
+			URL:    fmt.Sprintf("https://dnsrepo.noc.org/api/?apikey=%s&search=%s", randomApiKey, domain),
+			Source: "dnsrepo",
+			UID:    randomApiKey,
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++

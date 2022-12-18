@@ -1,4 +1,4 @@
-// Package github GitHub search package
+// Package github GitHub search package  (Not usable refactoring needed)
 // Based on gwen001's https://github.com/gwen001/github-search github-subdomains
 package github
 
@@ -95,7 +95,13 @@ func (s *Source) enumerate(ctx context.Context, searchURL string, domainRegexp *
 	}
 
 	// Initial request to GitHub search
-	resp, err := session.Get(ctx, searchURL, "", headers)
+	resp, err := session.Do(ctx, &subscraping.Options{
+		Method:  http.MethodGet,
+		URL:     searchURL,
+		Headers: headers,
+		Source:  "github",
+		UID:     token.Hash,
+	})
 	isForbidden := resp != nil && resp.StatusCode == http.StatusForbidden
 	if err != nil && !isForbidden {
 		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
@@ -154,7 +160,12 @@ func (s *Source) enumerate(ctx context.Context, searchURL string, domainRegexp *
 func (s *Source) proccesItems(ctx context.Context, items []item, domainRegexp *regexp.Regexp, name string, session *subscraping.Session, results chan subscraping.Result) error {
 	for _, item := range items {
 		// find subdomains in code
-		resp, err := session.SimpleGet(ctx, rawURL(item.HTMLURL))
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet,
+			URL:    rawURL(item.HTMLURL),
+			Source: "github",
+			UID:    "unauth",
+		})
 		if err != nil {
 			if resp != nil && resp.StatusCode != http.StatusNotFound {
 				session.DiscardHTTPResponse(resp)

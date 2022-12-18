@@ -4,6 +4,7 @@ package passivetotal
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"regexp"
 	"time"
 
@@ -53,15 +54,15 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 		// Create JSON Get body
 		var request = []byte(`{"query":"` + domain + `"}`)
 
-		resp, err := session.HTTPRequest(
-			ctx,
-			"GET",
-			"https://api.passivetotal.org/v2/enrichment/subdomains",
-			"",
-			map[string]string{"Content-Type": "application/json"},
-			bytes.NewBuffer(request),
-			subscraping.BasicAuth{Username: randomApiKey.username, Password: randomApiKey.password},
-		)
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method:      http.MethodGet,
+			URL:         "https://api.passivetotal.org/v2/enrichment/subdomains",
+			ContentType: "application/json",
+			Body:        bytes.NewBuffer(request),
+			BasicAuth:   subscraping.BasicAuth{Username: randomApiKey.username, Password: randomApiKey.password},
+			Source:      "passivetotal",
+			UID:         randomApiKey.username,
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++

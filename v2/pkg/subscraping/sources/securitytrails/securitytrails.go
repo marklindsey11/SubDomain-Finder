@@ -4,6 +4,7 @@ package securitytrails
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -43,7 +44,13 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 			return
 		}
 
-		resp, err := session.Get(ctx, fmt.Sprintf("https://api.securitytrails.com/v1/domain/%s/subdomains", domain), "", map[string]string{"APIKEY": randomApiKey})
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method:  http.MethodGet,
+			URL:     fmt.Sprintf("https://api.securitytrails.com/v1/domain/%s/subdomains", domain),
+			Headers: map[string]string{"APIKEY": randomApiKey},
+			Source:  "securitytrails",
+			UID:     randomApiKey,
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++

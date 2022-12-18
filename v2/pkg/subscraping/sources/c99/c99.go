@@ -4,6 +4,7 @@ package c99
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -50,7 +51,12 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 		}
 
 		searchURL := fmt.Sprintf("https://api.c99.nl/subdomainfinder?key=%s&domain=%s&json", randomApiKey, domain)
-		resp, err := session.SimpleGet(ctx, searchURL)
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet,
+			URL:    searchURL,
+			Source: "c99",
+			UID:    randomApiKey,
+		})
 		if err != nil {
 			session.DiscardHTTPResponse(resp)
 			return

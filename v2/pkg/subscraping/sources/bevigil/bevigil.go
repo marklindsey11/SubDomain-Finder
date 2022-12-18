@@ -4,6 +4,7 @@ package bevigil
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -43,8 +44,14 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 
 		getUrl := fmt.Sprintf("https://osint.bevigil.com/api/%s/subdomains/", domain)
 
-		resp, err := session.Get(ctx, getUrl, "", map[string]string{
-			"X-Access-Token": randomApiKey, "User-Agent": "subfinder",
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method: http.MethodGet,
+			URL:    getUrl,
+			Headers: map[string]string{
+				"X-Access-Token": randomApiKey, "User-Agent": "subfinder",
+			},
+			Source: "bevigil",
+			UID:    randomApiKey,
 		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}

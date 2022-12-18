@@ -85,7 +85,13 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 		}
 		for currentPage := 0; currentPage <= 100; currentPage++ {
 			api := fmt.Sprintf("https://api.zoomeye.org/web/search?query=hostname:%s&page=%d", domain, currentPage)
-			resp, err := session.Get(ctx, api, "", headers)
+			resp, err := session.Do(ctx, &subscraping.Options{
+				Method:  http.MethodGet,
+				URL:     api,
+				Headers: headers,
+				UID:     jwt,
+				Source:  "zoomeye",
+			})
 			isForbidden := resp != nil && resp.StatusCode == http.StatusForbidden
 			if err != nil {
 				if !isForbidden && currentPage == 0 {
@@ -130,7 +136,13 @@ func doLogin(ctx context.Context, session *subscraping.Session, randomApiKey api
 	if err != nil {
 		return "", err
 	}
-	resp, err := session.SimplePost(ctx, "https://api.zoomeye.org/user/login", "application/json", bytes.NewBuffer(body))
+	resp, err := session.Do(ctx, &subscraping.Options{
+		Method:  http.MethodPost,
+		URL:     "https://api.zoomeye.org/user/login",
+		Cookies: "application/json",
+		Body:    bytes.NewBuffer(body),
+		Source:  "zoomeye",
+	})
 	if err != nil {
 		session.DiscardHTTPResponse(resp)
 		return "", err

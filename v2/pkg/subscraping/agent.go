@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/corpix/uarand"
@@ -16,6 +17,49 @@ import (
 
 	"github.com/projectdiscovery/gologger"
 )
+
+// Options contains request options
+type Options struct {
+	Method      string
+	URL         string
+	Cookies     string
+	Headers     map[string]string
+	ContentType string
+	Body        io.Reader
+	Source      string
+	UID         string             // API Key (used for UID) in ratelimit
+	Cancel      context.CancelFunc // To be used when ratelimit is hit
+	BasicAuth   BasicAuth          // Basic Auth
+}
+
+func (o *Options) getRequest(ctx context.Context) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, o.Method, o.URL, o.Body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", uarand.GetRandom())
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en")
+	req.Header.Set("Connection", "close")
+
+	if o.BasicAuth.Username != "" || o.BasicAuth.Password != "" {
+		req.SetBasicAuth(o.BasicAuth.Username, o.BasicAuth.Password)
+	}
+
+	if o.Cookies != "" {
+		req.Header.Set("Cookie", o.Cookies)
+	}
+	if o.Headers != nil {
+		for k, v := range o.Headers {
+			req.Header.Add(k, v)
+		}
+	}
+	if o.ContentType != "" {
+		req.Header.Add("Content-Type", o.ContentType)
+	}
+
+	return req, nil
+}
 
 // NewSession creates a new session object for a domain
 func NewSession(domain string, proxy string, rateLimit, timeout int) (*Session, error) {
@@ -49,10 +93,12 @@ func NewSession(domain string, proxy string, rateLimit, timeout int) (*Session, 
 	session := &Session{Client: client}
 
 	// Initiate rate limit instance
-	if rateLimit > 0 {
-		session.RateLimiter = ratelimit.New(context.Background(), uint(rateLimit), time.Second)
-	} else {
-		session.RateLimiter = ratelimit.NewUnlimited(context.Background())
+	if rateLimit != 0 {
+		session.RateLimiter, _ = ratelimit.NewMultiLimiter(context.TODO(), &ratelimit.Options{
+			Key:      "default", // for sources with unknown ratelimits
+			MaxCount: uint(rateLimit),
+			Duration: time.Minute, // from observations refer DefaultRateLimits
+		})
 	}
 
 	// Create a new extractor object for the current domain
@@ -62,53 +108,95 @@ func NewSession(domain string, proxy string, rateLimit, timeout int) (*Session, 
 	return session, err
 }
 
-// Get makes a GET request to a URL with extended parameters
-func (s *Session) Get(ctx context.Context, getURL, cookies string, headers map[string]string) (*http.Response, error) {
-	return s.HTTPRequest(ctx, http.MethodGet, getURL, cookies, headers, nil, BasicAuth{})
+func (s *Session) ratelimit(opts *Options) {
+	// ratelimit disabled
+	if s.RateLimiter == nil {
+		return
+	}
+	sourceId := opts.Source
+	if opts.UID != "" {
+		sourceId += "-" + opts.UID
+	}
+	// check if ratelimit of this source is available
+	source, ok := DefaultRateLimits[opts.Source]
+	if !ok || source.MaxCount == 0 {
+		// When ratelimit is unknown or not possible to implement
+		// use default rate limit with user defined value
+		sourceId = "default"
+	}
+	err := s.RateLimiter.Take(sourceId)
+	if err != nil {
+		// does not exist
+		if err = s.RateLimiter.Add(&ratelimit.Options{
+			Key:         sourceId,
+			IsUnlimited: false,
+			MaxCount:    source.MaxCount,
+			Duration:    source.Duration,
+		}); err != nil {
+			gologger.Debug().Label("Err").Msgf("failed to create new ratelimit: %v", err)
+		}
+		if errx := s.RateLimiter.Take(sourceId); errx != nil {
+			gologger.Debug().Label("Err").Msgf("failed to take ratelimit: %v", err)
+		}
+	}
 }
 
-// SimpleGet makes a simple GET request to a URL
-func (s *Session) SimpleGet(ctx context.Context, getURL string) (*http.Response, error) {
-	return s.HTTPRequest(ctx, http.MethodGet, getURL, "", map[string]string{}, nil, BasicAuth{})
-}
-
-// Post makes a POST request to a URL with extended parameters
-func (s *Session) Post(ctx context.Context, postURL, cookies string, headers map[string]string, body io.Reader) (*http.Response, error) {
-	return s.HTTPRequest(ctx, http.MethodPost, postURL, cookies, headers, body, BasicAuth{})
-}
-
-// SimplePost makes a simple POST request to a URL
-func (s *Session) SimplePost(ctx context.Context, postURL, contentType string, body io.Reader) (*http.Response, error) {
-	return s.HTTPRequest(ctx, http.MethodPost, postURL, "", map[string]string{"Content-Type": contentType}, body, BasicAuth{})
-}
-
-// HTTPRequest makes any HTTP request to a URL with extended parameters
-func (s *Session) HTTPRequest(ctx context.Context, method, requestURL, cookies string, headers map[string]string, body io.Reader, basicAuth BasicAuth) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, requestURL, body)
+// Do creates , sends http request and returns response
+func (s *Session) Do(ctx context.Context, opts *Options) (*http.Response, error) {
+	req, err := opts.getRequest(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	req.Header.Set("User-Agent", uarand.GetRandom())
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Language", "en")
-	req.Header.Set("Connection", "close")
-
-	if basicAuth.Username != "" || basicAuth.Password != "" {
-		req.SetBasicAuth(basicAuth.Username, basicAuth.Password)
+	s.ratelimit(opts)
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return nil, err
 	}
-
-	if cookies != "" {
-		req.Header.Set("Cookie", cookies)
+	// Check If Rate Limit was hit
+	if resp.StatusCode == 429 || (resp.StatusCode == 204 && opts.Source == "censys") {
+		// time after which ratelimit will be reset
+		var rlwaittime time.Duration
+		if rl, ok := DefaultRateLimits[opts.Source]; ok {
+			rlwaittime = rl.Duration
+		}
+		if resp.Header.Get("Retry-After") != "" {
+			retryAfter, er := strconv.Atoi(resp.Header.Get("Retry-After"))
+			if er != nil {
+				rlwaittime = time.Duration(retryAfter) * time.Second
+			}
+		}
+		if rlwaittime == 0 || rlwaittime > time.Duration(5)*time.Second {
+			if opts.Cancel != nil {
+				opts.Cancel()
+			} // Stop source completely
+			gologger.Debug().Label("RTL").MsgFunc(func() string {
+				if rlwaittime == 0 {
+					return fmt.Sprintf("rate limit exceeded for source %v skipping...", opts.Source)
+				} else {
+					return fmt.Sprintf("rate limit exceeded for source %v refresh time too high %v.skipping source", opts.Source, rlwaittime)
+				}
+			})
+		} else {
+			// sleep and reset (will be implemented in retryablehttp-go)
+			s.RateLimiter.SleepandReset(rlwaittime, &ratelimit.Options{
+				Key:      opts.Source,
+				MaxCount: 1,
+				Duration: time.Second,
+			})
+		}
+		return nil, fmt.Errorf("ratelimit hit")
 	}
+	if resp.StatusCode != http.StatusOK {
+		requestURL, _ := url.QueryUnescape(req.URL.String())
 
-	for key, value := range headers {
-		req.Header.Set(key, value)
+		gologger.Debug().MsgFunc(func() string {
+			buffer := new(bytes.Buffer)
+			_, _ = buffer.ReadFrom(resp.Body)
+			return fmt.Sprintf("Response for failed request against '%s':\n%s", requestURL, buffer.String())
+		})
+		return resp, fmt.Errorf("unexpected status code %d received from '%s'", resp.StatusCode, requestURL)
 	}
-
-	s.RateLimiter.Take()
-
-	return httpRequestWrapper(s.Client, req)
+	return resp, nil
 }
 
 // DiscardHTTPResponse discards the response content by demand
@@ -121,23 +209,4 @@ func (s *Session) DiscardHTTPResponse(response *http.Response) {
 		}
 		response.Body.Close()
 	}
-}
-
-func httpRequestWrapper(client *http.Client, request *http.Request) (*http.Response, error) {
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-
-	if response.StatusCode != http.StatusOK {
-		requestURL, _ := url.QueryUnescape(request.URL.String())
-
-		gologger.Debug().MsgFunc(func() string {
-			buffer := new(bytes.Buffer)
-			_, _ = buffer.ReadFrom(response.Body)
-			return fmt.Sprintf("Response for failed request against '%s':\n%s", requestURL, buffer.String())
-		})
-		return response, fmt.Errorf("unexpected status code %d received from '%s'", response.StatusCode, requestURL)
-	}
-	return response, nil
 }

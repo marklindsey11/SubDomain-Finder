@@ -3,6 +3,7 @@ package fullhunt
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -43,7 +44,13 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 			return
 		}
 
-		resp, err := session.Get(ctx, fmt.Sprintf("https://fullhunt.io/api/v1/domain/%s/subdomains", domain), "", map[string]string{"X-API-KEY": randomApiKey})
+		resp, err := session.Do(ctx, &subscraping.Options{
+			Method:  http.MethodGet,
+			URL:     fmt.Sprintf("https://fullhunt.io/api/v1/domain/%s/subdomains", domain),
+			Headers: map[string]string{"X-API-KEY": randomApiKey},
+			Source:  "fullhunt",
+			UID:     randomApiKey,
+		})
 		if err != nil {
 			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
 			s.errors++
