@@ -6,9 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 type alienvaultResponse struct {
@@ -21,60 +20,53 @@ type alienvaultResponse struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	timeTaken time.Duration
-	results   int
-	errors    int
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method: http.MethodGet,
-			URL:    fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/domain/%s/passive_dns", domain),
-			Source: "alienvault",
-		})
-		if err != nil && resp == nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			session.DiscardHTTPResponse(resp)
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
+	}
+}
 
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{}
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/domain/%s/passive_dns", domain),
+		Source: "alienvault",
+	}
+
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
 		var response alienvaultResponse
 		// Get the response body and decode
-		err = json.NewDecoder(resp.Body).Decode(&response)
+		err := json.NewDecoder(resp.Body).Decode(&response)
 		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			resp.Body.Close()
-			return
+			return err
 		}
-		resp.Body.Close()
-
 		if response.Error != "" {
-			results <- subscraping.Result{
-				Source: s.Name(), Type: subscraping.Error, Error: fmt.Errorf("%s, %s", response.Detail, response.Error),
-			}
-			return
+			return fmt.Errorf("%s, %s", response.Detail, response.Error)
 		}
-
 		for _, record := range response.PassiveDNS {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: record.Hostname}
-			s.results++
+			executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: record.Hostname}
 		}
-	}()
-
-	return results
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -96,12 +88,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(_ []string) {
 	// no key needed
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-	}
 }

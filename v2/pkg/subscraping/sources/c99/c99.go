@@ -9,7 +9,7 @@ import (
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
-
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
@@ -32,63 +32,63 @@ type dnsdbLookupResponse struct {
 	Error string `json:"error"`
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey == "" {
-			s.skipped = true
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
-		}
-
-		searchURL := fmt.Sprintf("https://api.c99.nl/subdomainfinder?key=%s&domain=%s&json", randomApiKey, domain)
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method: http.MethodGet,
-			URL:    searchURL,
-			Source: "c99",
-			UID:    randomApiKey,
-		})
-		if err != nil {
-			session.DiscardHTTPResponse(resp)
-			return
-		}
-
-		defer resp.Body.Close()
-
-		var response dnsdbLookupResponse
-		err = jsoniter.NewDecoder(resp.Body).Decode(&response)
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			return
-		}
-
-		if response.Error != "" {
-			results <- subscraping.Result{
-				Source: s.Name(), Type: subscraping.Error, Error: fmt.Errorf("%v", response.Error),
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
 			}
-			s.errors++
-			return
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
+		}
+	}
+}
+
+// Run function returns all subdomains found with the service
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+
+	randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey == "" {
+		return task
+	}
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    fmt.Sprintf("https://api.c99.nl/subdomainfinder?key=%s&domain=%s&json", randomApiKey, domain),
+		Source: "c99",
+		UID:    randomApiKey,
+	}
+
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
+		var response dnsdbLookupResponse
+		err := jsoniter.NewDecoder(resp.Body).Decode(&response)
+		if err != nil {
+			return err
+		}
+		if response.Error != "" {
+			return fmt.Errorf("%v", response.Error)
 		}
 
 		for _, data := range response.Subdomains {
 			if !strings.HasPrefix(data.Subdomain, ".") {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: data.Subdomain}
+				executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: data.Subdomain}
 				s.results++
 			}
 		}
-	}()
-
-	return results
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source

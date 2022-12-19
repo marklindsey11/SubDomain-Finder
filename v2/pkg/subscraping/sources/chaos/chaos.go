@@ -4,56 +4,68 @@ package chaos
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/projectdiscovery/chaos-client/pkg/chaos"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []string
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	apiKeys []string
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(_ context.Context, domain string, _ *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey == "" {
-			s.skipped = true
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
+		}
+	}
+}
+
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+		RequestOpts: &core.Options{
+			Source: "chaos",
+		},
+	}
+
+	// should not reference any variables/methods outside of task
+	task.Override = func(t *core.Task, ctx context.Context, executor *core.Executor) error {
+		randomApiKey := subscraping.PickRandom(s.apiKeys, t.RequestOpts.Source)
+		if randomApiKey == "" {
+			// s.skipped = true
+			return nil
 		}
 
 		chaosClient := chaos.New(randomApiKey)
 		for result := range chaosClient.GetSubdomains(&chaos.SubdomainsRequest{
-			Domain: domain,
+			Domain: t.Domain,
 		}) {
 			if result.Error != nil {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: result.Error}
-				s.errors++
+				executor.Result <- core.Result{Source: t.RequestOpts.Source, Type: core.Error, Error: result.Error}
 				break
 			}
-			results <- subscraping.Result{
-				Source: s.Name(), Type: subscraping.Subdomain, Value: fmt.Sprintf("%s.%s", result.Subdomain, domain),
+			executor.Result <- core.Result{
+				Source: t.RequestOpts.Source, Type: core.Subdomain, Value: fmt.Sprintf("%s.%s", result.Subdomain, domain),
 			}
-			s.results++
 		}
-	}()
-
-	return results
+		return nil // does not fallback to default task execution
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -75,13 +87,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(keys []string) {
 	s.apiKeys = keys
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }

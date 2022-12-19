@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	jsoniter "github.com/json-iterator/go"
 
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
@@ -24,88 +24,75 @@ type response struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []string
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	apiKeys []string
+}
+
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctxcancel.Done():
+			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
+		}
+	}
 }
 
 // Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+	randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey == "" {
+		return task
+	}
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey == "" {
-			s.skipped = true
-			return
-		}
-
-		s.getData(ctx, fmt.Sprintf("https://tls.bufferover.run/dns?q=.%s", domain), randomApiKey, session, results)
-	}()
-
-	return results
-}
-
-func (s *Source) getData(ctx context.Context, sourceURL string, apiKey string, session *subscraping.Session, results chan subscraping.Result) {
-	resp, err := session.Do(ctx, &subscraping.Options{
+	task.RequestOpts = &core.Options{
 		Method:  http.MethodGet,
-		URL:     sourceURL,
-		Headers: map[string]string{"x-api-key": apiKey},
+		URL:     fmt.Sprintf("https://tls.bufferover.run/dns?q=.%s", domain),
+		Headers: map[string]string{"x-api-key": randomApiKey},
 		Source:  "bufferover",
-		UID:     apiKey,
-	})
-	if err != nil && resp == nil {
-		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-		s.errors++
-		session.DiscardHTTPResponse(resp)
-		return
+		UID:     randomApiKey,
 	}
 
-	var bufforesponse response
-	err = jsoniter.NewDecoder(resp.Body).Decode(&bufforesponse)
-	if err != nil {
-		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-		s.errors++
-		resp.Body.Close()
-		return
-	}
-
-	resp.Body.Close()
-
-	metaErrors := bufforesponse.Meta.Errors
-
-	if len(metaErrors) > 0 {
-		results <- subscraping.Result{
-			Source: s.Name(), Type: subscraping.Error, Error: fmt.Errorf("%s", strings.Join(metaErrors, ", ")),
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
+		var bufforesponse response
+		err := jsoniter.NewDecoder(resp.Body).Decode(&bufforesponse)
+		if err != nil {
+			return err
 		}
-		s.errors++
-		return
-	}
-
-	var subdomains []string
-
-	if len(bufforesponse.FDNSA) > 0 {
-		subdomains = bufforesponse.FDNSA
-		subdomains = append(subdomains, bufforesponse.RDNS...)
-	} else if len(bufforesponse.Results) > 0 {
-		subdomains = bufforesponse.Results
-	}
-
-	for _, subdomain := range subdomains {
-		for _, value := range session.Extractor.FindAllString(subdomain, -1) {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: value}
+		metaErrors := bufforesponse.Meta.Errors
+		if len(metaErrors) > 0 {
+			return fmt.Errorf("%s", strings.Join(metaErrors, ", "))
 		}
-		s.results++
+
+		var subdomains []string
+		if len(bufforesponse.FDNSA) > 0 {
+			subdomains = bufforesponse.FDNSA
+			subdomains = append(subdomains, bufforesponse.RDNS...)
+		} else if len(bufforesponse.Results) > 0 {
+			subdomains = bufforesponse.Results
+		}
+
+		for _, subdomain := range subdomains {
+			for _, value := range executor.Extractor.Get(t.Domain).FindAllString(subdomain, -1) {
+				executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: value}
+			}
+		}
+		return nil
 	}
+	return task
 }
 
 // Name returns the name of the source
@@ -127,13 +114,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(keys []string) {
 	s.apiKeys = keys
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }

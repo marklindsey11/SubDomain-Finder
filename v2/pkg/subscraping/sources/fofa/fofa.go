@@ -10,8 +10,7 @@ import (
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
-
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 type fofaResponse struct {
@@ -35,69 +34,65 @@ type apiKey struct {
 	secret   string
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey.username == "" || randomApiKey.secret == "" {
-			s.skipped = true
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
-		}
-
-		// fofa api doc https://fofa.info/static_pages/api_help
-		qbase64 := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("domain=\"%s\"", domain)))
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method: http.MethodGet,
-			URL:    fmt.Sprintf("https://fofa.info/api/v1/search/all?full=true&fields=host&page=1&size=10000&email=%s&key=%s&qbase64=%s", randomApiKey.username, randomApiKey.secret, qbase64),
-			Source: "fofa",
-			UID:    randomApiKey.secret,
-		})
-		if err != nil && resp == nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			session.DiscardHTTPResponse(resp)
-			return
-		}
-
-		var response fofaResponse
-		err = jsoniter.NewDecoder(resp.Body).Decode(&response)
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			resp.Body.Close()
-			return
-		}
-		resp.Body.Close()
-
-		if response.Error {
-			results <- subscraping.Result{
-				Source: s.Name(), Type: subscraping.Error, Error: fmt.Errorf("%s", response.ErrMsg),
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
 			}
-			s.errors++
-			return
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
+	}
+}
 
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey.username == "" || randomApiKey.secret == "" {
+		return task
+	}
+
+	qbase64 := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("domain=\"%s\"", domain)))
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    fmt.Sprintf("https://fofa.info/api/v1/search/all?full=true&fields=host&page=1&size=10000&email=%s&key=%s&qbase64=%s", randomApiKey.username, randomApiKey.secret, qbase64),
+		Source: "fofa",
+		UID:    randomApiKey.secret,
+	}
+
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
+		var response fofaResponse
+		err := jsoniter.NewDecoder(resp.Body).Decode(&response)
+		if err != nil {
+			return err
+		}
+		if response.Error {
+			return fmt.Errorf("%s", response.ErrMsg)
+		}
 		if response.Size > 0 {
 			for _, subdomain := range response.Results {
 				if strings.HasPrefix(strings.ToLower(subdomain), "http://") || strings.HasPrefix(strings.ToLower(subdomain), "https://") {
 					subdomain = subdomain[strings.Index(subdomain, "//")+2:]
 				}
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: subdomain}
+				executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: subdomain}
 				s.results++
 			}
 		}
-	}()
-
-	return results
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -118,16 +113,7 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = subscraping.CreateApiKeys(keys, func(k, v string) apiKey {
+	s.apiKeys = core.CreateApiKeys(keys, func(k, v string) apiKey {
 		return apiKey{k, v}
 	})
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }

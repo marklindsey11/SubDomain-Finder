@@ -9,11 +9,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 const (
@@ -29,46 +30,47 @@ type indexResponse struct {
 }
 
 // Source is the passive scraping agent
-type Source struct {
-	timeTaken time.Duration
-	errors    int
-	results   int
+type Source struct{}
+
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for {
+		select {
+		case <-ctxcancel.Done():
+			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
+		}
+	}
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    indexURL,
+		Source: "commoncrawl",
+	}
 
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method: http.MethodGet,
-			URL:    indexURL,
-			Source: "commoncrawl",
-		})
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			session.DiscardHTTPResponse(resp)
-			return
-		}
+	// search page response
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
 
 		var indexes []indexResponse
-		err = jsoniter.NewDecoder(resp.Body).Decode(&indexes)
+		err := jsoniter.NewDecoder(resp.Body).Decode(&indexes)
 		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			resp.Body.Close()
-			return
+			return err
 		}
-		resp.Body.Close()
-
 		years := make([]string, 0)
 		for i := 0; i < maxYearsBack; i++ {
 			years = append(years, strconv.Itoa(year-i))
@@ -85,16 +87,16 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 				}
 			}
 		}
-
-		for _, apiURL := range searchIndexes {
-			further := s.getSubdomains(ctx, apiURL, domain, session, results)
-			if !further {
-				break
+		// get subdomains
+		core.Dispatch(func(wg *sync.WaitGroup) {
+			defer wg.Done()
+			for _, apiURL := range searchIndexes {
+				executor.Task <- getSubdomains(apiURL, t.Domain)
 			}
-		}
-	}()
-
-	return results
+		})
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -118,52 +120,36 @@ func (s *Source) AddApiKeys(_ []string) {
 	// no key needed
 }
 
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
+func getSubdomains(searchURL, domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
 	}
-}
-
-func (s *Source) getSubdomains(ctx context.Context, searchURL, domain string, session *subscraping.Session, results chan subscraping.Result) bool {
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-			var headers = map[string]string{"Host": "index.commoncrawl.org"}
-			resp, err := session.Do(ctx, &subscraping.Options{
-				Method:  http.MethodGet,
-				URL:     fmt.Sprintf("%s?url=*.%s", searchURL, domain),
-				Headers: headers,
-				Source:  "commoncrawl",
-			})
-			if err != nil {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-				session.DiscardHTTPResponse(resp)
-				return false
+	task.RequestOpts = &core.Options{
+		Method:  http.MethodGet,
+		URL:     fmt.Sprintf("%s?url=*.%s", searchURL, domain),
+		Headers: map[string]string{"Host": "index.commoncrawl.org"},
+		Source:  "commoncrawl",
+	}
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
 			}
+			line, _ = url.QueryUnescape(line)
+			subdomain := executor.Extractor.Get(t.Domain).FindString(line)
+			if subdomain != "" {
+				// fix for triple encoded URL
+				subdomain = strings.ToLower(subdomain)
+				subdomain = strings.TrimPrefix(subdomain, "25")
+				subdomain = strings.TrimPrefix(subdomain, "2f")
 
-			scanner := bufio.NewScanner(resp.Body)
-			for scanner.Scan() {
-				line := scanner.Text()
-				if line == "" {
-					continue
-				}
-				line, _ = url.QueryUnescape(line)
-				subdomain := session.Extractor.FindString(line)
-				if subdomain != "" {
-					// fix for triple encoded URL
-					subdomain = strings.ToLower(subdomain)
-					subdomain = strings.TrimPrefix(subdomain, "25")
-					subdomain = strings.TrimPrefix(subdomain, "2f")
-
-					results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: subdomain}
-				}
+				executor.Result <- core.Result{Source: t.RequestOpts.Source, Type: core.Subdomain, Value: subdomain}
 			}
-			resp.Body.Close()
-			return true
 		}
+		return nil
 	}
+	return task
 }

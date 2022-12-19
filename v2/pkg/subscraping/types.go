@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/projectdiscovery/ratelimit"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 // BasicAuth request's Authorization header
@@ -25,10 +26,8 @@ type Statistics struct {
 
 // Source is an interface inherited by each passive source
 type Source interface {
-	// Run takes a domain as argument and a session object
-	// which contains the extractor for subdomains, http client
-	// and other stuff.
-	Run(context.Context, string, *Session) <-chan Result
+	// Daemon creates a daemon goroutine for sources
+	Daemon(ctx context.Context, executor *core.Executor)
 
 	// Name returns the name of the source. It is preferred to use lower case names.
 	Name() string

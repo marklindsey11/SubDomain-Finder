@@ -14,6 +14,7 @@ import (
 	// postgres driver
 	_ "github.com/lib/pq"
 
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
@@ -24,41 +25,75 @@ type subdomain struct {
 
 // Source is the passive scraping agent
 type Source struct {
+	subscraping.Base
 	timeTaken time.Duration
 	errors    int
 	results   int
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		count := s.getSubdomainsFromSQL(domain, session, results)
-		if count > 0 {
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
-		_ = s.getSubdomainsFromHTTP(ctx, domain, session, results)
-	}()
-
-	return results
+	}
 }
 
-func (s *Source) getSubdomainsFromSQL(domain string, session *subscraping.Session, results chan subscraping.Result) int {
-	db, err := sql.Open("postgres", "host=crt.sh user=guest dbname=certwatch sslmode=disable binary_parameters=yes")
-	if err != nil {
-		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-		s.errors++
-		return 0
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{}
+	opts := &core.Options{
+		Method: http.MethodGet,
+		URL:    fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain),
+		Source: "crtsh",
+	}
+	task.RequestOpts = opts
+
+	task.Override = func(t *core.Task, ctx context.Context, executor *core.Executor) error {
+		count, err := getSubdomainsFromSQL(domain, t.RequestOpts.Source, executor)
+		if err != nil || count == 0 {
+			return fmt.Errorf("fallback to default")
+		}
+		return nil
 	}
 
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
+		var subdomains []subdomain
+		err := jsoniter.NewDecoder(resp.Body).Decode(&subdomains)
+		if err != nil {
+			return err
+		}
+		for _, subdomain := range subdomains {
+			for _, sub := range strings.Split(subdomain.NameValue, "\n") {
+				value := executor.Extractor.Get(domain).FindString(sub)
+				if value != "" {
+					executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: value}
+				}
+				s.results++
+			}
+		}
+		return nil
+	}
+	return task
+}
+
+func getSubdomainsFromSQL(domain string, source string, e *core.Executor) (int, error) {
+	db, err := sql.Open("postgres", "host=crt.sh user=guest dbname=certwatch sslmode=disable binary_parameters=yes")
+	if err != nil {
+		return 0, err
+	}
 	defer db.Close()
 
 	query := `WITH ci AS (
@@ -89,14 +124,10 @@ func (s *Source) getSubdomainsFromSQL(domain string, session *subscraping.Sessio
 				ORDER BY le.ENTRY_TIMESTAMP DESC NULLS LAST;`
 	rows, err := db.Query(query, domain)
 	if err != nil {
-		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-		s.errors++
-		return 0
+		return 0, err
 	}
 	if err := rows.Err(); err != nil {
-		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-		s.errors++
-		return 0
+		return 0, err
 	}
 
 	var count int
@@ -105,58 +136,18 @@ func (s *Source) getSubdomainsFromSQL(domain string, session *subscraping.Sessio
 	for rows.Next() {
 		err := rows.Scan(&data)
 		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			return count
+			return 0, err
 		}
 
 		count++
 		for _, subdomain := range strings.Split(data, "\n") {
-			value := session.Extractor.FindString(subdomain)
+			value := e.Extractor.Get(domain).FindString(subdomain)
 			if value != "" {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: value}
-				s.results++
+				e.Result <- core.Result{Source: source, Type: core.Subdomain, Value: value}
 			}
 		}
 	}
-	return count
-}
-
-func (s *Source) getSubdomainsFromHTTP(ctx context.Context, domain string, session *subscraping.Session, results chan subscraping.Result) bool {
-	resp, err := session.Do(ctx, &subscraping.Options{
-		Method: http.MethodGet,
-		URL:    fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain),
-		Source: "crtsh",
-	})
-	if err != nil {
-		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-		s.errors++
-		session.DiscardHTTPResponse(resp)
-		return false
-	}
-
-	var subdomains []subdomain
-	err = jsoniter.NewDecoder(resp.Body).Decode(&subdomains)
-	if err != nil {
-		results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-		s.errors++
-		resp.Body.Close()
-		return false
-	}
-
-	resp.Body.Close()
-
-	for _, subdomain := range subdomains {
-		for _, sub := range strings.Split(subdomain.NameValue, "\n") {
-			value := session.Extractor.FindString(sub)
-			if value != "" {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: value}
-			}
-			s.results++
-		}
-	}
-
-	return true
+	return count, nil
 }
 
 // Name returns the name of the source
@@ -178,12 +169,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(_ []string) {
 	// no key needed
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-	}
 }

@@ -6,58 +6,58 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 // Source is the passive scraping agent
-type Source struct {
-	timeTaken time.Duration
-	errors    int
-	results   int
+type Source struct{}
+
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctxcancel.Done():
+			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
+		}
+	}
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
-
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method: http.MethodGet,
-			URL:    fmt.Sprintf("https://riddler.io/search?q=pld:%s&view_type=data_table", domain),
-			Source: "riddler",
-		})
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			session.DiscardHTTPResponse(resp)
-			return
-		}
-
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    fmt.Sprintf("https://riddler.io/search?q=pld:%s&view_type=data_table", domain),
+		Source: "riddler",
+	}
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
 			line := scanner.Text()
 			if line == "" {
 				continue
 			}
-			subdomain := session.Extractor.FindString(line)
+			subdomain := executor.Extractor.Get(domain).FindString(line)
 			if subdomain != "" {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: subdomain}
-				s.results++
+				executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: subdomain}
 			}
 		}
-		resp.Body.Close()
-	}()
-
-	return results
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -79,12 +79,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(_ []string) {
 	// no key needed
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-	}
 }

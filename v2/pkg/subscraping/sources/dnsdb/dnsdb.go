@@ -8,11 +8,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	jsoniter "github.com/json-iterator/go"
-
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 type dnsdbResponse struct {
@@ -21,50 +19,56 @@ type dnsdbResponse struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []string
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	apiKeys []string
+}
+
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctxcancel.Done():
+			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
+		}
+	}
 }
 
 // Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
+	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey == "" {
+		return task
+	}
 
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey == "" {
-			return
-		}
+	headers := map[string]string{
+		"X-API-KEY":    randomApiKey,
+		"Accept":       "application/json",
+		"Content-Type": "application/json",
+	}
 
-		headers := map[string]string{
-			"X-API-KEY":    randomApiKey,
-			"Accept":       "application/json",
-			"Content-Type": "application/json",
-		}
+	task.RequestOpts = &core.Options{
+		Method:  http.MethodGet,
+		URL:     fmt.Sprintf("https://api.dnsdb.info/lookup/rrset/name/*.%s?limit=1000000000000", domain),
+		Headers: headers,
+		Source:  "dnsdb",
+		UID:     randomApiKey,
+	}
 
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method:  http.MethodGet,
-			URL:     fmt.Sprintf("https://api.dnsdb.info/lookup/rrset/name/*.%s?limit=1000000000000", domain),
-			Headers: headers,
-			Source:  "dnsdb",
-			UID:     randomApiKey,
-		})
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			session.DiscardHTTPResponse(resp)
-			return
-		}
-
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -72,21 +76,17 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 				continue
 			}
 			var response dnsdbResponse
-			err = jsoniter.NewDecoder(bytes.NewBufferString(line)).Decode(&response)
+			err := jsoniter.NewDecoder(bytes.NewBufferString(line)).Decode(&response)
 			if err != nil {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-				s.errors++
-				return
+				return err
 			}
-			results <- subscraping.Result{
-				Source: s.Name(), Type: subscraping.Subdomain, Value: strings.TrimSuffix(response.Name, "."),
+			executor.Result <- core.Result{
+				Source: s.Name(), Type: core.Subdomain, Value: strings.TrimSuffix(response.Name, "."),
 			}
-			s.results++
 		}
-		resp.Body.Close()
-	}()
-
-	return results
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -108,13 +108,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(keys []string) {
 	s.apiKeys = keys
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }

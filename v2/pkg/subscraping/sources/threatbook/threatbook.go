@@ -6,11 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"time"
 
 	jsoniter "github.com/json-iterator/go"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 type threatBookResponse struct {
@@ -27,78 +26,70 @@ type threatBookResponse struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []string
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	apiKeys []string
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey == "" {
-			s.skipped = true
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
+	}
+}
 
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method: http.MethodGet,
-			URL:    fmt.Sprintf("https://api.threatbook.cn/v3/domain/sub_domains?apikey=%s&resource=%s", randomApiKey, domain),
-			Source: "threatbook",
-			UID:    randomApiKey,
-		})
-		if err != nil && resp == nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			session.DiscardHTTPResponse(resp)
-			return
-		}
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey == "" {
+		return task
+	}
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    fmt.Sprintf("https://api.threatbook.cn/v3/domain/sub_domains?apikey=%s&resource=%s", randomApiKey, domain),
+		Source: "threatbook",
+		UID:    randomApiKey,
+	}
+
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
 
 		var response threatBookResponse
-		err = jsoniter.NewDecoder(resp.Body).Decode(&response)
+		err := jsoniter.NewDecoder(resp.Body).Decode(&response)
 		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			resp.Body.Close()
-			return
+			return err
 		}
-		resp.Body.Close()
-
 		if response.ResponseCode != 0 {
-			results <- subscraping.Result{
-				Source: s.Name(), Type: subscraping.Error,
-				Error: fmt.Errorf("code %d, %s", response.ResponseCode, response.VerboseMsg),
-			}
-			s.errors++
-			return
+			return fmt.Errorf("code %d, %s", response.ResponseCode, response.VerboseMsg)
 		}
 
 		total, err := strconv.ParseInt(response.Data.SubDomains.Total, 10, 64)
 		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			return
+			return err
 		}
 
 		if total > 0 {
 			for _, subdomain := range response.Data.SubDomains.Data {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: subdomain}
+				executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: subdomain}
 			}
 		}
-	}()
+		return nil
+	}
 
-	return results
+	return task
 }
 
 // Name returns the name of the source
@@ -120,13 +111,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(keys []string) {
 	s.apiKeys = keys
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }

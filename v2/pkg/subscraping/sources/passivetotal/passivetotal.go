@@ -6,11 +6,9 @@ import (
 	"context"
 	"net/http"
 	"regexp"
-	"time"
 
 	jsoniter "github.com/json-iterator/go"
-
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 var passiveTotalFilterRegex = regexp.MustCompile(`^(?:\d{1,3}\.){3}\d{1,3}\\032`)
@@ -21,11 +19,7 @@ type response struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []apiKey
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	apiKeys []apiKey
 }
 
 type apiKey struct {
@@ -33,52 +27,53 @@ type apiKey struct {
 	password string
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey.username == "" || randomApiKey.password == "" {
-			s.skipped = true
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
+	}
+}
 
-		// Create JSON Get body
-		var request = []byte(`{"query":"` + domain + `"}`)
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey.username == "" || randomApiKey.password == "" {
+		return task
+	}
+	// Create JSON Get body
+	var request = []byte(`{"query":"` + domain + `"}`)
+	task.RequestOpts = &core.Options{
+		Method:      http.MethodGet,
+		URL:         "https://api.passivetotal.org/v2/enrichment/subdomains",
+		ContentType: "application/json",
+		Body:        bytes.NewBuffer(request),
+		BasicAuth:   core.BasicAuth{Username: randomApiKey.username, Password: randomApiKey.password},
+		Source:      "passivetotal",
+		UID:         randomApiKey.username,
+	}
 
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method:      http.MethodGet,
-			URL:         "https://api.passivetotal.org/v2/enrichment/subdomains",
-			ContentType: "application/json",
-			Body:        bytes.NewBuffer(request),
-			BasicAuth:   subscraping.BasicAuth{Username: randomApiKey.username, Password: randomApiKey.password},
-			Source:      "passivetotal",
-			UID:         randomApiKey.username,
-		})
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			session.DiscardHTTPResponse(resp)
-			return
-		}
-
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
 		var data response
-		err = jsoniter.NewDecoder(resp.Body).Decode(&data)
+		err := jsoniter.NewDecoder(resp.Body).Decode(&data)
 		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			resp.Body.Close()
-			return
+			return err
 		}
-		resp.Body.Close()
 
 		for _, subdomain := range data.Subdomains {
 			// skip entries like xxx.xxx.xxx.xxx\032domain.tld
@@ -86,12 +81,11 @@ func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Se
 				continue
 			}
 			finalSubdomain := subdomain + "." + domain
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: finalSubdomain}
-			s.results++
+			executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: finalSubdomain}
 		}
-	}()
-
-	return results
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -112,16 +106,7 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = subscraping.CreateApiKeys(keys, func(k, v string) apiKey {
+	s.apiKeys = core.CreateApiKeys(keys, func(k, v string) apiKey {
 		return apiKey{k, v}
 	})
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }

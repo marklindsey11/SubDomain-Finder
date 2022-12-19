@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
+	"sync"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 // search results
@@ -22,75 +22,76 @@ type zoomeyeResults struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []string
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	apiKeys []string
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey == "" {
-			s.skipped = true
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
+	}
+}
 
-		headers := map[string]string{
-			"API-KEY":      randomApiKey,
-			"Accept":       "application/json",
-			"Content-Type": "application/json",
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey == "" {
+		return task
+	}
+	headers := map[string]string{
+		"API-KEY":      randomApiKey,
+		"Accept":       "application/json",
+		"Content-Type": "application/json",
+	}
+	currentPage := 1
+	api := fmt.Sprintf("https://api.zoomeye.org/domain/search?q=%s&type=1&s=1000&page=%d", domain, currentPage)
+	task.RequestOpts = &core.Options{
+		Method:  http.MethodGet,
+		URL:     api,
+		Headers: headers,
+		Source:  "zoomeyeapi",
+		UID:     randomApiKey,
+	}
+
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
+		var res zoomeyeResults
+		err := json.NewDecoder(resp.Body).Decode(&res)
+		if err != nil {
+			return err
 		}
-		var pages = 1
-		for currentPage := 1; currentPage <= pages; currentPage++ {
-			api := fmt.Sprintf("https://api.zoomeye.org/domain/search?q=%s&type=1&s=1000&page=%d", domain, currentPage)
-			resp, err := session.Do(ctx, &subscraping.Options{
-				Method:  http.MethodGet,
-				URL:     api,
-				Headers: headers,
-				Source:  "zoomeyeapi",
-				UID:     randomApiKey,
-			})
-			isForbidden := resp != nil && resp.StatusCode == http.StatusForbidden
-			if err != nil {
-				if !isForbidden {
-					results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-					s.errors++
-					session.DiscardHTTPResponse(resp)
+		for _, r := range res.List {
+			executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: r.Name}
+		}
+		pages := int(res.Total/1000) + 1
+		if pages > 1 {
+			core.Dispatch(func(wg *sync.WaitGroup) {
+				defer wg.Done()
+				for i := 2; i < pages; i++ {
+					tx := t.Clone()
+					tx.RequestOpts.URL = fmt.Sprintf("https://api.zoomeye.org/domain/search?q=%s&type=1&s=1000&page=%d", domain, i)
+					executor.Task <- *tx
 				}
-				return
-			}
-
-			var res zoomeyeResults
-			err = json.NewDecoder(resp.Body).Decode(&res)
-
-			if err != nil {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-				s.errors++
-				_ = resp.Body.Close()
-				return
-			}
-			_ = resp.Body.Close()
-			pages = int(res.Total/1000) + 1
-			for _, r := range res.List {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: r.Name}
-				s.results++
-			}
+			})
 		}
-	}()
-
-	return results
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -112,13 +113,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(keys []string) {
 	s.apiKeys = keys
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }

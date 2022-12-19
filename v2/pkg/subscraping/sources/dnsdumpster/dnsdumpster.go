@@ -9,9 +9,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
-	"time"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 // CSRFSubMatchLength CSRF regex submatch length
@@ -28,14 +27,16 @@ func getCSRFToken(page string) string {
 }
 
 // postForm posts a form for a domain and returns the response
-func postForm(ctx context.Context, session *subscraping.Session, token, domain string) (string, error) {
+func postForm(domain string, token string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
 	params := url.Values{
 		"csrfmiddlewaretoken": {token},
 		"targetip":            {domain},
 		"user":                {"free"},
 	}
-
-	resp, err := session.Do(ctx, &subscraping.Options{
+	task.RequestOpts = &core.Options{
 		Method:  http.MethodPost,
 		URL:     "https://dnsdumpster.com/",
 		Cookies: fmt.Sprintf("csrftoken=%s; Domain=dnsdumpster.com", token),
@@ -45,75 +46,75 @@ func postForm(ctx context.Context, session *subscraping.Session, token, domain s
 			"X-CSRF-Token": token,
 		},
 		Body:      strings.NewReader(params.Encode()),
-		BasicAuth: subscraping.BasicAuth{},
+		BasicAuth: core.BasicAuth{},
 		Source:    "dnsdumpster",
-	})
-
-	if err != nil {
-		session.DiscardHTTPResponse(resp)
-		return "", err
 	}
 
-	// Now, grab the entire page
-	in, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	return string(in), err
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
+		in, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		data := string(in)
+		for _, subdomain := range executor.Extractor.Get(domain).FindAllString(data, -1) {
+			executor.Result <- core.Result{Source: "dnsdumpster", Type: core.Subdomain, Value: subdomain}
+		}
+		return nil
+	}
+	return task
 }
 
 // Source is the passive scraping agent
-type Source struct {
-	timeTaken time.Duration
-	errors    int
-	results   int
+type Source struct{}
+
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctxcancel.Done():
+			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
+		}
+	}
 }
 
 // Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    "https://dnsdumpster.com/",
+	}
 
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method: http.MethodGet,
-			URL:    "https://dnsdumpster.com/",
-		})
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			session.DiscardHTTPResponse(resp)
-			return
-		}
-
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			resp.Body.Close()
-			return
+			return err
 		}
 		resp.Body.Close()
-
 		csrfToken := getCSRFToken(string(body))
-		data, err := postForm(ctx, session, csrfToken, domain)
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			return
+		if csrfToken == "" {
+			return fmt.Errorf("failed to fetch csrf token")
+		} else {
+			executor.Task <- postForm(domain, csrfToken)
+			return nil
 		}
-
-		for _, subdomain := range session.Extractor.FindAllString(data, -1) {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: subdomain}
-			s.results++
-		}
-	}()
-
-	return results
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -135,12 +136,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(_ []string) {
 	// no key needed
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-	}
 }

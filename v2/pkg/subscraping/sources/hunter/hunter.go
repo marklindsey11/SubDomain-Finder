@@ -5,10 +5,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
-	"time"
+	"sync"
 
 	jsoniter "github.com/json-iterator/go"
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 type hunterResp struct {
@@ -32,75 +32,78 @@ type hunterData struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []string
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	apiKeys []string
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey == "" {
-			s.skipped = true
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
+	}
+}
 
-		var pages = 1
-		for currentPage := 1; currentPage <= pages; currentPage++ {
-			// hunter api doc https://hunter.qianxin.com/home/helpCenter?r=5-1-2
-			qbase64 := base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("domain=\"%s\"", domain)))
-			resp, err := session.Do(ctx, &subscraping.Options{
-				Method: http.MethodGet,
-				URL:    fmt.Sprintf("https://hunter.qianxin.com/openApi/search?api-key=%s&search=%s&page=1&page_size=100&is_web=3", randomApiKey, qbase64),
-				Source: "hunter",
-				UID:    randomApiKey,
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey == "" {
+		return task
+	}
+
+	// hunter api doc https://hunter.qianxin.com/home/helpCenter?r=5-1-2
+	qbase64 := base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("domain=\"%s\"", domain)))
+	page := 1
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    fmt.Sprintf("https://hunter.qianxin.com/openApi/search?api-key=%s&search=%s&page=%s&page_size=100&is_web=3", randomApiKey, qbase64, page),
+		Source: "hunter",
+		UID:    randomApiKey,
+	}
+
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
+		var response hunterResp
+		err := jsoniter.NewDecoder(resp.Body).Decode(&response)
+		if err != nil {
+			return err
+		}
+		if response.Code == 401 || response.Code == 400 {
+			return fmt.Errorf("%s", response.Message)
+		}
+		if response.Data.Total > 0 {
+			for _, hunterInfo := range response.Data.InfoArr {
+				subdomain := hunterInfo.Domain
+				executor.Result <- core.Result{Source: "hunter", Type: core.Subdomain, Value: subdomain}
+			}
+		}
+		pages := int(response.Data.Total/1000) + 1
+		if pages > 1 {
+			core.Dispatch(func(wg *sync.WaitGroup) {
+				defer wg.Done()
+				for i := 2; i < pages; i++ {
+					tx := t.Clone()
+					tx.RequestOpts.URL = fmt.Sprintf("https://hunter.qianxin.com/openApi/search?api-key=%s&search=%s&page=%s&page_size=100&is_web=3", randomApiKey, qbase64, page)
+					executor.Task <- task
+				}
 			})
-			if err != nil && resp == nil {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-				s.errors++
-				session.DiscardHTTPResponse(resp)
-				return
-			}
-
-			var response hunterResp
-			err = jsoniter.NewDecoder(resp.Body).Decode(&response)
-			if err != nil {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-				resp.Body.Close()
-				return
-			}
-			resp.Body.Close()
-
-			if response.Code == 401 || response.Code == 400 {
-				results <- subscraping.Result{
-					Source: s.Name(), Type: subscraping.Error, Error: fmt.Errorf("%s", response.Message),
-				}
-				return
-			}
-
-			if response.Data.Total > 0 {
-				for _, hunterInfo := range response.Data.InfoArr {
-					subdomain := hunterInfo.Domain
-					results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: subdomain}
-				}
-			}
-			pages = int(response.Data.Total/1000) + 1
 		}
-	}()
-
-	return results
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -122,13 +125,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(keys []string) {
 	s.apiKeys = keys
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }

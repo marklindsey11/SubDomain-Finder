@@ -9,7 +9,7 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 type response struct {
@@ -25,47 +25,52 @@ type Source struct {
 	results   int
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method: http.MethodGet,
-			URL:    fmt.Sprintf("https://api.threatminer.org/v2/domain.php?q=%s&rt=5", domain),
-			Source: "threatminer",
-		})
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			session.DiscardHTTPResponse(resp)
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
+	}
+}
 
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    fmt.Sprintf("https://api.threatminer.org/v2/domain.php?q=%s&rt=5", domain),
+		Source: "threatminer",
+	}
+
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
 		defer resp.Body.Close()
-
 		var data response
-		err = jsoniter.NewDecoder(resp.Body).Decode(&data)
+		err := jsoniter.NewDecoder(resp.Body).Decode(&data)
 		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			return
+			return err
 		}
 
 		for _, subdomain := range data.Results {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: subdomain}
+			executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: subdomain}
 			s.results++
 		}
-	}()
-
-	return results
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -87,12 +92,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(_ []string) {
 	// no key needed
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-	}
 }

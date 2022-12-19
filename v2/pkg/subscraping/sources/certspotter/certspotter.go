@@ -5,11 +5,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
+	"sync"
 
 	jsoniter "github.com/json-iterator/go"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 type certspotterObject struct {
@@ -19,115 +19,74 @@ type certspotterObject struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []string
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	apiKeys []string
+}
+
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for {
+		select {
+		case <-ctxcancel.Done():
+			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
+		}
+	}
 }
 
 // Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey == "" {
+		return task
+	}
+	headers := map[string]string{"Authorization": "Bearer " + randomApiKey}
+	cookies := ""
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
+	task.RequestOpts = &core.Options{
+		Method:  http.MethodGet,
+		URL:     fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", domain),
+		Cookies: cookies,
+		Headers: headers,
+		UID:     randomApiKey,
+		Source:  "certspotter",
+	}
 
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey == "" {
-			s.skipped = true
-			return
-		}
-
-		headers := map[string]string{"Authorization": "Bearer " + randomApiKey}
-		cookies := ""
-
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method:  http.MethodGet,
-			URL:     fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", domain),
-			Cookies: cookies,
-			Headers: headers,
-			UID:     randomApiKey,
-			Source:  "certspotter",
-		})
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			session.DiscardHTTPResponse(resp)
-			return
-		}
-
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
 		var response []certspotterObject
-		err = jsoniter.NewDecoder(resp.Body).Decode(&response)
+		err := jsoniter.NewDecoder(resp.Body).Decode(&response)
 		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			resp.Body.Close()
-			return
+			return err
 		}
-		resp.Body.Close()
-
 		for _, cert := range response {
 			for _, subdomain := range cert.DNSNames {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: subdomain}
-				s.results++
+				executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: subdomain}
 			}
 		}
-
-		// if the number of responses is zero, close the channel and return.
+		// recursively check until response len is zero https://sslmate.com/help/reference/ct_search_api_v1
 		if len(response) == 0 {
-			return
+			return nil
 		}
-
 		id := response[len(response)-1].ID
-		for {
-			reqURL := fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names&after=%s", domain, id)
 
-			resp, err := session.Do(ctx, &subscraping.Options{
-				Method:  http.MethodGet,
-				URL:     reqURL,
-				Cookies: cookies,
-				Headers: headers,
-				UID:     randomApiKey,
-				Source:  "certspotter",
-			})
-			if err != nil {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-				s.errors++
-				return
-			}
-
-			var response []certspotterObject
-			err = jsoniter.NewDecoder(resp.Body).Decode(&response)
-			if err != nil {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-				s.errors++
-				resp.Body.Close()
-				return
-			}
-			resp.Body.Close()
-
-			if len(response) == 0 {
-				break
-			}
-
-			for _, cert := range response {
-				for _, subdomain := range cert.DNSNames {
-					results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: subdomain}
-					s.results++
-				}
-			}
-
-			id = response[len(response)-1].ID
-		}
-	}()
-
-	return results
+		core.Dispatch(func(wg *sync.WaitGroup) {
+			tx := t.Clone()
+			tx.RequestOpts.URL = fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names&after=%s", domain, id)
+		})
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -149,13 +108,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(keys []string) {
 	s.apiKeys = keys
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }

@@ -9,7 +9,7 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 // Source is the passive scraping agent
@@ -28,63 +28,62 @@ type dnsdbLookupResponse struct {
 	Error      string   `json:"error"`
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey == "" {
-			s.skipped = true
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
+	}
+}
 
-		searchURL := fmt.Sprintf("https://api.shodan.io/dns/domain/%s?key=%s", domain, randomApiKey)
-		resp, err := session.Do(ctx, &subscraping.Options{
-			Method: http.MethodGet,
-			URL:    searchURL,
-			Source: "shodan",
-			UID:    randomApiKey,
-		})
-		if err != nil {
-			session.DiscardHTTPResponse(resp)
-			return
-		}
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey == "" {
+		return task
+	}
+	searchURL := fmt.Sprintf("https://api.shodan.io/dns/domain/%s?key=%s", domain, randomApiKey)
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    searchURL,
+		Source: "shodan",
+		UID:    randomApiKey,
+	}
 
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
 		defer resp.Body.Close()
-
 		var response dnsdbLookupResponse
-		err = jsoniter.NewDecoder(resp.Body).Decode(&response)
+		err := jsoniter.NewDecoder(resp.Body).Decode(&response)
 		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			return
+			return err
 		}
 
 		if response.Error != "" {
-			results <- subscraping.Result{
-				Source: s.Name(), Type: subscraping.Error, Error: fmt.Errorf("%v", response.Error),
-			}
-			s.errors++
-			return
+			return fmt.Errorf("%v", response.Error)
 		}
 
 		for _, data := range response.Subdomains {
-			results <- subscraping.Result{
-				Source: s.Name(), Type: subscraping.Subdomain, Value: fmt.Sprintf("%s.%s", data, domain),
+			executor.Result <- core.Result{
+				Source: s.Name(), Type: core.Subdomain, Value: fmt.Sprintf("%s.%s", data, domain),
 			}
-			s.results++
 		}
-	}()
-
-	return results
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -106,13 +105,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(keys []string) {
 	s.apiKeys = keys
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }
