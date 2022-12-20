@@ -7,7 +7,7 @@ import (
 )
 
 type Base struct {
-	CreateTask func(string) core.Task
+	CreateTask func(domain string) core.Task
 }
 
 // Source Daemon

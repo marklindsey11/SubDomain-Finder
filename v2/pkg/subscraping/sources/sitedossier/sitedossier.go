@@ -5,98 +5,69 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"regexp"
-	"time"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
-
-// SleepRandIntn is the integer value to get the pseudo-random number
-// to sleep before find the next match
-const SleepRandIntn = 5
 
 var reNext = regexp.MustCompile(`<a href="([A-Za-z0-9/.]+)"><b>`)
 
-type agent struct {
-	results chan subscraping.Result
-	errors  int
-	session *subscraping.Session
-}
-
-func (a *agent) enumerate(ctx context.Context, baseURL string) {
-	select {
-	case <-ctx.Done():
-		return
-	default:
-	}
-
-	resp, err := a.session.Do(ctx, &subscraping.Options{
-		Method: http.MethodGet,
-		URL:    baseURL,
-		Source: "sitedossier",
-	})
-	isnotfound := resp != nil && resp.StatusCode == http.StatusNotFound
-	if err != nil && !isnotfound {
-		a.results <- subscraping.Result{Source: "sitedossier", Type: subscraping.Error, Error: err}
-		a.errors++
-		a.session.DiscardHTTPResponse(resp)
-		return
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		a.results <- subscraping.Result{Source: "sitedossier", Type: subscraping.Error, Error: err}
-		a.errors++
-		resp.Body.Close()
-		return
-	}
-	resp.Body.Close()
-
-	src := string(body)
-	for _, match := range a.session.Extractor.FindAllString(src, -1) {
-		a.results <- subscraping.Result{Source: "sitedossier", Type: subscraping.Subdomain, Value: match}
-	}
-
-	match1 := reNext.FindStringSubmatch(src)
-	time.Sleep(time.Duration((3 + rand.Intn(SleepRandIntn))) * time.Second)
-
-	if len(match1) > 0 {
-		a.enumerate(ctx, "http://www.sitedossier.com"+match1[1])
-	}
-}
-
 // Source is the passive scraping agent
-type Source struct {
-	timeTaken time.Duration
-	errors    int
-	results   int
+type Source struct{}
+
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctxcancel.Done():
+			return
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
+			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
+		}
+	}
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
-
-	a := agent{
-		session: session,
-		results: results,
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
 	}
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(a.results)
-		}(time.Now())
+	task.RequestOpts = &core.Options{
+		Method: http.MethodGet,
+		URL:    fmt.Sprintf("http://www.sitedossier.com/parentdomain/%s", domain),
+		Source: "sitedossier",
+	}
 
-		a.enumerate(ctx, fmt.Sprintf("http://www.sitedossier.com/parentdomain/%s", domain))
-		s.errors = a.errors
-		s.results = len(a.results)
-	}()
-
-	return a.results
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("expected status code 200 got %v", resp.StatusCode)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		src := string(body)
+		for _, match := range executor.Extractor.Get(domain).FindAllString(src, -1) {
+			executor.Result <- core.Result{Source: "sitedossier", Type: core.Subdomain, Value: match}
+		}
+		match1 := reNext.FindStringSubmatch(src)
+		if len(match1) > 0 {
+			tx := t.Clone()
+			tx.RequestOpts.URL = "http://www.sitedossier.com" + match1[1]
+		}
+		return nil
+	}
+	return task
 }
 
 // Name returns the name of the source
@@ -118,12 +89,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(_ []string) {
 	// no key needed
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-	}
 }

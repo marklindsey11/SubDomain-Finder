@@ -5,12 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-	"time"
+	"sync"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 // zoomAuth holds the ZoomEye credentials
@@ -33,11 +32,7 @@ type zoomeyeResults struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []apiKey
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	apiKeys []apiKey
 }
 
 type apiKey struct {
@@ -45,117 +40,107 @@ type apiKey struct {
 	password string
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey.username == "" || randomApiKey.password == "" {
-			s.skipped = true
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
-		}
-
-		jwt, err := doLogin(ctx, session, randomApiKey)
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			return
-		}
-		// check if jwt is null
-		if jwt == "" {
-			results <- subscraping.Result{
-				Source: s.Name(), Type: subscraping.Error, Error: errors.New("could not log into zoomeye"),
-			}
-			s.errors++
-			return
-		}
-
-		headers := map[string]string{
-			"Authorization": fmt.Sprintf("JWT %s", jwt),
-			"Accept":        "application/json",
-			"Content-Type":  "application/json",
-		}
-		for currentPage := 0; currentPage <= 100; currentPage++ {
-			api := fmt.Sprintf("https://api.zoomeye.org/web/search?query=hostname:%s&page=%d", domain, currentPage)
-			resp, err := session.Do(ctx, &subscraping.Options{
-				Method:  http.MethodGet,
-				URL:     api,
-				Headers: headers,
-				UID:     jwt,
-				Source:  "zoomeye",
-			})
-			isForbidden := resp != nil && resp.StatusCode == http.StatusForbidden
-			if err != nil {
-				if !isForbidden && currentPage == 0 {
-					results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-					s.errors++
-					session.DiscardHTTPResponse(resp)
-				}
+		case domain, ok := <-e.Domain:
+			if !ok {
 				return
 			}
-
-			var res zoomeyeResults
-			err = json.NewDecoder(resp.Body).Decode(&res)
-			if err != nil {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-				s.errors++
-				resp.Body.Close()
-				return
-			}
-			resp.Body.Close()
-
-			for _, r := range res.Matches {
-				results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: r.Site}
-				s.results++
-				for _, domain := range r.Domains {
-					results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: domain}
-					s.results++
-				}
-			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
-	}()
-
-	return results
+	}
 }
 
-// doLogin performs authentication on the ZoomEye API
-func doLogin(ctx context.Context, session *subscraping.Session, randomApiKey apiKey) (string, error) {
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+
+	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey.username == "" || randomApiKey.password == "" {
+		return task
+	}
+
 	creds := &zoomAuth{
 		User: randomApiKey.username,
 		Pass: randomApiKey.password,
 	}
 	body, err := json.Marshal(&creds)
 	if err != nil {
-		return "", err
+		return task
 	}
-	resp, err := session.Do(ctx, &subscraping.Options{
+
+	task.RequestOpts = &core.Options{
 		Method:  http.MethodPost,
 		URL:     "https://api.zoomeye.org/user/login",
 		Cookies: "application/json",
 		Body:    bytes.NewBuffer(body),
 		Source:  "zoomeye",
-	})
-	if err != nil {
-		session.DiscardHTTPResponse(resp)
-		return "", err
 	}
 
-	defer resp.Body.Close()
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
+		var login loginResp
+		err = json.NewDecoder(resp.Body).Decode(&login)
+		if err != nil {
+			return fmt.Errorf("failed to fetch jwt token after login: %v", err)
+		}
+		jwtToken := login.JWT
+		if jwtToken == "" {
+			return fmt.Errorf("jwt missing skipping source")
+		}
 
-	var login loginResp
-	err = json.NewDecoder(resp.Body).Decode(&login)
-	if err != nil {
-		return "", err
+		core.Dispatch(func(wg *sync.WaitGroup) {
+			defer wg.Done()
+			headers := map[string]string{
+				"Authorization": fmt.Sprintf("JWT %s", jwtToken),
+				"Accept":        "application/json",
+				"Content-Type":  "application/json",
+			}
+			//TODO: check if it possible to fetch number of pages
+			for currentPage := 0; currentPage <= 100; currentPage++ {
+				tx := core.Task{
+					Domain: domain,
+				}
+				tx.RequestOpts = &core.Options{
+					Method:  http.MethodGet,
+					URL:     fmt.Sprintf("https://api.zoomeye.org/web/search?query=hostname:%s&page=%d", domain, currentPage),
+					Headers: headers,
+					UID:     jwtToken,
+					Source:  "zoomeye",
+				}
+				tx.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+					defer resp.Body.Close()
+					if resp.StatusCode != 200 {
+						return fmt.Errorf("got %v status code expected 200", resp.StatusCode)
+					}
+					var res zoomeyeResults
+					err := json.NewDecoder(resp.Body).Decode(&res)
+					if err != nil {
+						return err
+					}
+					for _, r := range res.Matches {
+						executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: r.Site}
+						for _, domain := range r.Domains {
+							executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: domain}
+						}
+					}
+					return nil
+				}
+			}
+		})
+		return nil
 	}
-	return login.JWT, nil
+	return task
 }
 
 // Name returns the name of the source
@@ -176,16 +161,7 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = subscraping.CreateApiKeys(keys, func(k, v string) apiKey {
+	s.apiKeys = core.CreateApiKeys(keys, func(k, v string) apiKey {
 		return apiKey{k, v}
 	})
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }

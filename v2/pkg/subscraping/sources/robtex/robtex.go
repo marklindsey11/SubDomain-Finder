@@ -7,11 +7,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
+	"sync"
 
 	jsoniter "github.com/json-iterator/go"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
+	"github.com/projectdiscovery/subfinder/v2/pkg/core"
 )
 
 const (
@@ -22,11 +22,7 @@ const (
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []string
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	apiKeys []string
 }
 
 type result struct {
@@ -35,85 +31,107 @@ type result struct {
 	Rrtype string `json:"rrtype"`
 }
 
-// Run function returns all subdomains found with the service
-func (s *Source) Run(ctx context.Context, domain string, session *subscraping.Session) <-chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	s.errors = 0
-	s.results = 0
+// Source Daemon
+func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
+	ctxcancel, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	go func() {
-		defer func(startTime time.Time) {
-			s.timeTaken = time.Since(startTime)
-			close(results)
-		}(time.Now())
-
-		randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-		if randomApiKey == "" {
-			s.skipped = true
+	for {
+		select {
+		case <-ctxcancel.Done():
 			return
-		}
-
-		headers := map[string]string{"Content-Type": "application/x-ndjson"}
-
-		ips, err := enumerate(ctx, session, fmt.Sprintf("%s/forward/%s?key=%s", baseURL, domain, randomApiKey), headers)
-		if err != nil {
-			results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-			s.errors++
-			return
-		}
-
-		for _, result := range ips {
-			if result.Rrtype == addrRecord || result.Rrtype == iPv6AddrRecord {
-				domains, err := enumerate(ctx, session, fmt.Sprintf("%s/reverse/%s?key=%s", baseURL, result.Rrdata, randomApiKey), headers)
-				if err != nil {
-					results <- subscraping.Result{Source: s.Name(), Type: subscraping.Error, Error: err}
-					s.errors++
-					return
-				}
-				for _, result := range domains {
-					results <- subscraping.Result{Source: s.Name(), Type: subscraping.Subdomain, Value: result.Rrdata}
-					s.results++
-				}
+		case domain, ok := <-e.Domain:
+			if !ok {
+				return
 			}
+			task := s.CreateTask(domain)
+			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
+			e.Task <- task
 		}
-	}()
-
-	return results
+	}
 }
 
-func enumerate(ctx context.Context, session *subscraping.Session, targetURL string, headers map[string]string) ([]result, error) {
-	var results []result
-
-	resp, err := session.Do(ctx, &subscraping.Options{
-		Method:  http.MethodGet,
-		URL:     targetURL,
-		Headers: headers,
-		Source:  "robtex",
-		UID:     subscraping.HashID(headers),
-	})
-	if err != nil {
-		session.DiscardHTTPResponse(resp)
-		return results, err
+func (s *Source) CreateTask(domain string) core.Task {
+	task := core.Task{
+		Domain: domain,
+	}
+	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
+	if randomApiKey == "" {
+		return task
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-		var response result
-		err = jsoniter.NewDecoder(bytes.NewBufferString(line)).Decode(&response)
-		if err != nil {
-			return results, err
-		}
-
-		results = append(results, response)
+	task.RequestOpts = &core.Options{
+		Method:      http.MethodGet,
+		URL:         fmt.Sprintf("%s/forward/%s?key=%s", baseURL, domain, randomApiKey),
+		Source:      "robtex",
+		ContentType: "application/x-ndjson",
+		UID:         randomApiKey,
 	}
 
-	resp.Body.Close()
+	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+		defer resp.Body.Close()
 
-	return results, nil
+		results := []result{}
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			var response result
+			err := jsoniter.NewDecoder(bytes.NewBufferString(line)).Decode(&response)
+			if err != nil {
+				return err
+			}
+			results = append(results, response)
+		}
+
+		if len(results) > 0 {
+			core.Dispatch(func(wg *sync.WaitGroup) {
+				defer wg.Done()
+				for _, scanres := range results {
+					if scanres.Rrtype == addrRecord || scanres.Rrtype == iPv6AddrRecord {
+						tx := core.Task{
+							Domain: domain,
+						}
+						rkey := core.PickRandom(s.apiKeys, s.Name())
+
+						tx.RequestOpts = &core.Options{
+							Method:      http.MethodGet,
+							URL:         fmt.Sprintf("%s/reverse/%s?key=%s", baseURL, scanres.Rrdata, rkey),
+							Source:      "robtex",
+							ContentType: "application/x-ndjson",
+							UID:         rkey,
+						}
+
+						tx.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
+							defer resp.Body.Close()
+							scanner := bufio.NewScanner(resp.Body)
+							for scanner.Scan() {
+								line := scanner.Text()
+								if line == "" {
+									continue
+								}
+								var response result
+								err := jsoniter.NewDecoder(bytes.NewBufferString(line)).Decode(&response)
+								if err != nil {
+									return err
+								}
+								if response.Rrdata != "" {
+									executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: response.Rrdata}
+								}
+							}
+							return nil
+						}
+						executor.Task <- tx
+					}
+				}
+			})
+		}
+		return nil
+	}
+
+	return task
 }
 
 // Name returns the name of the source
@@ -135,13 +153,4 @@ func (s *Source) NeedsKey() bool {
 
 func (s *Source) AddApiKeys(keys []string) {
 	s.apiKeys = keys
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
 }
