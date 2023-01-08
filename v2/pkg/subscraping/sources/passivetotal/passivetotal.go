@@ -9,6 +9,7 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/projectdiscovery/subfinder/v2/pkg/core"
+	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
 var passiveTotalFilterRegex = regexp.MustCompile(`^(?:\d{1,3}\.){3}\d{1,3}\\032`)
@@ -19,42 +20,27 @@ type response struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys []apiKey
-}
-
-type apiKey struct {
-	username string
-	password string
+	subscraping.BaseSource
 }
 
 // Source Daemon
-func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
-	ctxcancel, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	for {
-		select {
-		case <-ctxcancel.Done():
-			return
-		case domain, ok := <-e.Domain:
-			if !ok {
-				return
-			}
-			task := s.CreateTask(domain)
-			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
-			e.Task <- task
-		}
-	}
+func (s *Source) Daemon(ctx context.Context, e *core.Extractor, input <-chan string, output chan<- core.Task) {
+	s.BaseSource.Name = s.Name()
+	s.init()
+	s.BaseSource.Daemon(ctx, e, nil, input, output)
 }
 
-func (s *Source) CreateTask(domain string) core.Task {
+// inits the source before passing to daemon
+func (s *Source) init() {
+	s.BaseSource.RequiresKey = true
+	s.BaseSource.CreateTask = s.dispatcher
+}
+
+func (s *Source) dispatcher(domain string) core.Task {
 	task := core.Task{
 		Domain: domain,
 	}
-	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
-	if randomApiKey.username == "" || randomApiKey.password == "" {
-		return task
-	}
+	apiusername, apipassword, _ := subscraping.GetMultiPartKey(s.GetRandomKey())
 	// Create JSON Get body
 	var request = []byte(`{"query":"` + domain + `"}`)
 	task.RequestOpts = &core.Options{
@@ -62,9 +48,9 @@ func (s *Source) CreateTask(domain string) core.Task {
 		URL:         "https://api.passivetotal.org/v2/enrichment/subdomains",
 		ContentType: "application/json",
 		Body:        bytes.NewBuffer(request),
-		BasicAuth:   core.BasicAuth{Username: randomApiKey.username, Password: randomApiKey.password},
+		BasicAuth:   core.BasicAuth{Username: apiusername, Password: apipassword},
 		Source:      "passivetotal",
-		UID:         randomApiKey.username,
+		UID:         apiusername,
 	}
 
 	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
@@ -106,7 +92,5 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = core.CreateApiKeys(keys, func(k, v string) apiKey {
-		return apiKey{k, v}
-	})
+	s.AddKeys(keys...)
 }

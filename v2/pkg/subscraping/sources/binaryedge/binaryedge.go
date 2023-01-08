@@ -39,44 +39,32 @@ type subdomainsResponse struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys []string
+	subscraping.BaseSource
 }
 
 // Source Daemon
-func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
-	ctxcancel, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (s *Source) Daemon(ctx context.Context, e *core.Extractor, input <-chan string, output chan<- core.Task) {
+	s.BaseSource.Name = s.Name()
+	s.init()
+	s.BaseSource.Daemon(ctx, e, nil, input, output)
+}
 
-	for {
-		select {
-		case <-ctxcancel.Done():
-			return
-		case domain, ok := <-e.Domain:
-			if !ok {
-				return
-			}
-			task := s.CreateTask(domain)
-			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
-			e.Task <- task
-		}
-	}
+// inits the source before passing to daemon
+func (s *Source) init() {
+	s.BaseSource.RequiresKey = true
+	s.BaseSource.CreateTask = s.dispatcher
 }
 
 // Run function returns all subdomains found with the service
-func (s *Source) CreateTask(domain string) core.Task {
+func (s *Source) dispatcher(domain string) core.Task {
 	task := core.Task{}
 
-	randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-	if randomApiKey == "" {
-		// s.skipped = true
-		return task
-	}
-	authHeader := map[string]string{"X-Key": randomApiKey}
+	randomApiKey := s.BaseSource.GetRandomKey()
 
 	task.RequestOpts = &core.Options{
 		Method:  http.MethodGet,
 		URL:     v2SubscriptionURL,
-		Headers: authHeader,
+		Headers: map[string]string{"X-Key": randomApiKey},
 		UID:     randomApiKey,
 		Source:  "binaryedge",
 	}
@@ -113,7 +101,6 @@ func (s *Source) CreateTask(domain string) core.Task {
 		t.RequestOpts.URL = pageURL.String()
 		return fmt.Errorf("fallback to Onresponse")
 	}
-	// s.enumerate(ctx, session, baseURL, firstPage, authHeader, results)
 
 	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
 		defer resp.Body.Close()
@@ -124,11 +111,11 @@ func (s *Source) CreateTask(domain string) core.Task {
 		}
 		// Check error messages
 		if response.Message != "" && response.Status != nil {
-			executor.Result <- core.Result{Source: s.Name(), Type: core.Error, Error: fmt.Errorf(response.Message)}
+			executor.Result <- core.Result{Source: "binaryedge", Type: core.Error, Error: fmt.Errorf(response.Message)}
 			return fmt.Errorf(response.Message)
 		}
 		for _, subdomain := range response.Subdomains {
-			executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: subdomain}
+			executor.Result <- core.Result{Source: "binaryedge", Type: core.Subdomain, Value: subdomain}
 		}
 
 		// Create new tasks
@@ -141,6 +128,9 @@ func (s *Source) CreateTask(domain string) core.Task {
 				tx := t.Clone()
 				pageurl, _ := addURLParam(tx.RequestOpts.URL, pageParam, strconv.Itoa(firstPage))
 				t.RequestOpts.URL = pageurl.String()
+				rkey := s.BaseSource.GetRandomKey()
+				t.RequestOpts.UID = rkey
+				t.RequestOpts.Headers = map[string]string{"X-Key": rkey}
 				executor.Task <- *tx
 			}
 		})
@@ -167,7 +157,7 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = keys
+	s.BaseSource.AddKeys(keys...)
 }
 
 func isV2(ctx context.Context, reqopts *core.Options, session *core.Session) bool {

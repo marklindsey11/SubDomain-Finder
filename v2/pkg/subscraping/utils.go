@@ -49,6 +49,16 @@ func PickRandom[T any](v []T, sourceName string) T {
 	return v[rand.Intn(length)]
 }
 
+func GetMultiPartKey(key string) (partA, partB string, ok bool) {
+	parts := strings.Split(key, ":")
+	ok = (len(parts) == MultipleKeyPartsLength)
+	if ok {
+		partA = parts[0]
+		partB = parts[1]
+	}
+	return
+}
+
 func CreateApiKeys[T any](keys []string, provider func(k, v string) T) []T {
 	var result []T
 	for _, key := range keys {

@@ -27,7 +27,7 @@ type Statistics struct {
 // Source is an interface inherited by each passive source
 type Source interface {
 	// Daemon creates a daemon goroutine for sources
-	Daemon(ctx context.Context, executor *core.Executor)
+	Daemon(ctx context.Context, e *core.Extractor, input <-chan string, output chan<- core.Task)
 
 	// Name returns the name of the source. It is preferred to use lower case names.
 	Name() string
@@ -45,9 +45,6 @@ type Source interface {
 	NeedsKey() bool
 
 	AddApiKeys([]string)
-
-	// Statistics returns the scrapping statistics for the source
-	Statistics() Statistics
 }
 
 // Session is the option passed to the source, an option is created

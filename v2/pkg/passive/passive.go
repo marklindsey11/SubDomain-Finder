@@ -1,57 +1,47 @@
 package passive
 
-import (
-	"context"
-	"fmt"
-	"sort"
-	"sync"
-	"time"
+// // EnumerateSubdomains enumerates all the subdomains for a given domain
+// func (a *Agent) EnumerateSubdomains(domain string, proxy string, rateLimit, timeout int, maxEnumTime time.Duration) chan subscraping.Result {
+// 	results := make(chan subscraping.Result)
+// 	go func() {
+// 		defer close(results)
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
-)
+// 		session, err := subscraping.NewSession(domain, proxy, rateLimit, timeout)
+// 		if err != nil {
+// 			results <- subscraping.Result{
+// 				Type: subscraping.Error, Error: fmt.Errorf("could not init passive session for %s: %s", domain, err),
+// 			}
+// 			return
+// 		}
 
-// EnumerateSubdomains enumerates all the subdomains for a given domain
-func (a *Agent) EnumerateSubdomains(domain string, proxy string, rateLimit, timeout int, maxEnumTime time.Duration) chan subscraping.Result {
-	results := make(chan subscraping.Result)
-	go func() {
-		defer close(results)
+// 		ctx, cancel := context.WithTimeout(context.Background(), maxEnumTime)
 
-		session, err := subscraping.NewSession(domain, proxy, rateLimit, timeout)
-		if err != nil {
-			results <- subscraping.Result{
-				Type: subscraping.Error, Error: fmt.Errorf("could not init passive session for %s: %s", domain, err),
-			}
-			return
-		}
+// 		wg := &sync.WaitGroup{}
+// 		// Run each source in parallel on the target domain
+// 		for _, runner := range a.sources {
+// 			wg.Add(1)
 
-		ctx, cancel := context.WithTimeout(context.Background(), maxEnumTime)
+// 			go func(source subscraping.Source) {
+// 				for resp := range source.Run(ctx, domain, session) {
+// 					results <- resp
+// 				}
+// 				wg.Done()
+// 			}(runner)
+// 		}
+// 		wg.Wait()
+// 		cancel()
+// 	}()
+// 	return results
+// }
 
-		wg := &sync.WaitGroup{}
-		// Run each source in parallel on the target domain
-		for _, runner := range a.sources {
-			wg.Add(1)
+// func (a *Agent) GetStatistics() map[string]subscraping.Statistics {
+// 	stats := make(map[string]subscraping.Statistics)
+// 	sort.Slice(a.sources, func(i, j int) bool {
+// 		return a.sources[i].Name() > a.sources[j].Name()
+// 	})
 
-			go func(source subscraping.Source) {
-				for resp := range source.Run(ctx, domain, session) {
-					results <- resp
-				}
-				wg.Done()
-			}(runner)
-		}
-		wg.Wait()
-		cancel()
-	}()
-	return results
-}
-
-func (a *Agent) GetStatistics() map[string]subscraping.Statistics {
-	stats := make(map[string]subscraping.Statistics)
-	sort.Slice(a.sources, func(i, j int) bool {
-		return a.sources[i].Name() > a.sources[j].Name()
-	})
-
-	for _, source := range a.sources {
-		stats[source.Name()] = source.Statistics()
-	}
-	return stats
-}
+// 	for _, source := range a.sources {
+// 		stats[source.Name()] = source.Statistics()
+// 	}
+// 	return stats
+// }

@@ -30,52 +30,36 @@ type response struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys []apiKey
-}
-
-type apiKey struct {
-	token  string
-	secret string
+	subscraping.BaseSource
 }
 
 // Source Daemon
-func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
-	ctxcancel, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (s *Source) Daemon(ctx context.Context, e *core.Extractor, input <-chan string, output chan<- core.Task) {
+	s.BaseSource.Name = s.Name()
+	s.init()
+	s.BaseSource.Daemon(ctx, e, nil, input, output)
+}
 
-	for {
-		select {
-		case <-ctxcancel.Done():
-			return
-		case domain, ok := <-e.Domain:
-			if !ok {
-				return
-			}
-			task := s.CreateTask(domain)
-			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
-			e.Task <- task
-		}
-	}
+// inits the source before passing to daemon
+func (s *Source) init() {
+	s.BaseSource.RequiresKey = true
+	s.BaseSource.CreateTask = s.dispatcher
 }
 
 // Run function returns all subdomains found with the service
-func (s *Source) CreateTask(domain string) core.Task {
+func (s *Source) dispatcher(domain string) core.Task {
 	task := core.Task{
 		Domain: domain,
 	}
-	randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-	if randomApiKey.token == "" || randomApiKey.secret == "" {
-		return task
-	}
-
+	apitoken, apisecret, _ := subscraping.GetMultiPartKey(s.GetRandomKey())
 	task.RequestOpts = &core.Options{
 		Method:    http.MethodPost,
 		URL:       "https://search.censys.io/api/v1/search/certificates",
 		Headers:   map[string]string{"Content-Type": "application/json", "Accept": "application/json"},
 		Body:      getRequestBody(domain, 1),
-		BasicAuth: core.BasicAuth{Username: randomApiKey.token, Password: randomApiKey.secret},
+		BasicAuth: core.BasicAuth{Username: apitoken, Password: apisecret},
 		Source:    "censys",
-		UID:       randomApiKey.token,
+		UID:       apitoken,
 	}
 	task.Metdata = 1
 
@@ -133,9 +117,7 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = subscraping.CreateApiKeys(keys, func(k, v string) apiKey {
-		return apiKey{k, v}
-	})
+	s.BaseSource.AddKeys(keys...)
 }
 
 func getRequestBody(domain string, currentPage int) *bytes.Reader {

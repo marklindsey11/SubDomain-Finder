@@ -5,6 +5,7 @@ import (
 	"sync"
 )
 
+// internal waitgroup for workers
 var wg *sync.WaitGroup = &sync.WaitGroup{}
 
 // Executor Config
@@ -19,7 +20,6 @@ type Config struct {
 
 // Executor is responsible for executing all tasks obtained from sources
 type Executor struct {
-	Domain    chan string
 	Result    chan Result
 	Task      chan Task
 	MaxTasks  int
@@ -35,15 +35,33 @@ func (e *Executor) CreateWorkers(ctx context.Context) {
 	}
 }
 
+// workers that execute tasks
+func (e *Executor) worker(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task, ok := <-e.Task:
+			if !ok {
+				// Task channel closed
+				return
+			}
+			task.Execute(ctx, e)
+		}
+	}
+}
+
 // Wait until task completion
 func (e *Executor) Wait() {
 	wg.Wait()
+	close(e.Result)
 }
 
-func NewExecutor(cfg *Config) *Executor {
+// NewExecutor returns tasks executor
+func NewExecutor(cfg *Config, taskchan chan Task) *Executor {
 	exec := Executor{
-		Domain:    make(chan string, cfg.InputBufferSize),
-		Task:      make(chan Task, cfg.TaskBufferSize),
+		Task:      taskchan,
 		Result:    make(chan Result, 10),
 		MaxTasks:  cfg.MaxTasks,
 		Extractor: NewExtractor(),

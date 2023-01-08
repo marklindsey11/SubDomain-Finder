@@ -10,6 +10,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 
 	"github.com/projectdiscovery/subfinder/v2/pkg/core"
+	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
 type certspotterObject struct {
@@ -19,44 +20,34 @@ type certspotterObject struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys []string
+	subscraping.BaseSource
 }
 
 // Source Daemon
-func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
-	ctxcancel, cancel := context.WithCancel(ctx)
-	defer cancel()
-	for {
-		select {
-		case <-ctxcancel.Done():
-			return
-		case domain, ok := <-e.Domain:
-			if !ok {
-				return
-			}
-			task := s.CreateTask(domain)
-			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
-			e.Task <- task
-		}
-	}
+func (s *Source) Daemon(ctx context.Context, e *core.Extractor, input <-chan string, output chan<- core.Task) {
+	s.BaseSource.Name = s.Name()
+	s.init()
+	s.BaseSource.Daemon(ctx, e, nil, input, output)
+}
+
+// inits the source before passing to daemon
+func (s *Source) init() {
+	s.BaseSource.RequiresKey = true
+	s.BaseSource.CreateTask = s.dispatcher
 }
 
 // Run function returns all subdomains found with the service
-func (s *Source) CreateTask(domain string) core.Task {
+func (s *Source) dispatcher(domain string) core.Task {
 	task := core.Task{
 		Domain: domain,
 	}
-	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
-	if randomApiKey == "" {
-		return task
-	}
+	randomApiKey := s.BaseSource.GetRandomKey()
+
 	headers := map[string]string{"Authorization": "Bearer " + randomApiKey}
-	cookies := ""
 
 	task.RequestOpts = &core.Options{
 		Method:  http.MethodGet,
 		URL:     fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", domain),
-		Cookies: cookies,
 		Headers: headers,
 		UID:     randomApiKey,
 		Source:  "certspotter",
@@ -107,5 +98,5 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = keys
+	s.BaseSource.AddKeys(keys...)
 }

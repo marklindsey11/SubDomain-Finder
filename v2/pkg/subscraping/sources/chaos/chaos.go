@@ -12,30 +12,23 @@ import (
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys []string
+	subscraping.BaseSource
 }
 
 // Source Daemon
-func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
-	ctxcancel, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	for {
-		select {
-		case <-ctxcancel.Done():
-			return
-		case domain, ok := <-e.Domain:
-			if !ok {
-				return
-			}
-			task := s.CreateTask(domain)
-			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
-			e.Task <- task
-		}
-	}
+func (s *Source) Daemon(ctx context.Context, e *core.Extractor, input <-chan string, output chan<- core.Task) {
+	s.BaseSource.Name = s.Name()
+	s.init()
+	s.BaseSource.Daemon(ctx, e, nil, input, output)
 }
 
-func (s *Source) CreateTask(domain string) core.Task {
+// inits the source before passing to daemon
+func (s *Source) init() {
+	s.BaseSource.RequiresKey = true
+	s.BaseSource.CreateTask = s.dispatcher
+}
+
+func (s *Source) dispatcher(domain string) core.Task {
 	task := core.Task{
 		Domain: domain,
 		RequestOpts: &core.Options{
@@ -45,11 +38,7 @@ func (s *Source) CreateTask(domain string) core.Task {
 
 	// should not reference any variables/methods outside of task
 	task.Override = func(t *core.Task, ctx context.Context, executor *core.Executor) error {
-		randomApiKey := subscraping.PickRandom(s.apiKeys, t.RequestOpts.Source)
-		if randomApiKey == "" {
-			// s.skipped = true
-			return nil
-		}
+		randomApiKey := s.BaseSource.GetRandomKey()
 
 		chaosClient := chaos.New(randomApiKey)
 		for result := range chaosClient.GetSubdomains(&chaos.SubdomainsRequest{
@@ -86,5 +75,5 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = keys
+	s.BaseSource.AddKeys(keys...)
 }

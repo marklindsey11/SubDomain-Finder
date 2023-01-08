@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/projectdiscovery/subfinder/v2/pkg/core"
@@ -15,11 +14,7 @@ import (
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys   []string
-	timeTaken time.Duration
-	errors    int
-	results   int
-	skipped   bool
+	subscraping.BaseSource
 }
 
 type dnsdbLookupResponse struct {
@@ -33,35 +28,25 @@ type dnsdbLookupResponse struct {
 }
 
 // Source Daemon
-func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
-	ctxcancel, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (s *Source) Daemon(ctx context.Context, e *core.Extractor, input <-chan string, output chan<- core.Task) {
+	s.BaseSource.Name = s.Name()
+	s.init()
+	s.BaseSource.Daemon(ctx, e, nil, input, output)
+}
 
-	for {
-		select {
-		case <-ctxcancel.Done():
-			return
-		case domain, ok := <-e.Domain:
-			if !ok {
-				return
-			}
-			task := s.CreateTask(domain)
-			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
-			e.Task <- task
-		}
-	}
+// inits the source before passing to daemon
+func (s *Source) init() {
+	s.BaseSource.RequiresKey = true
+	s.BaseSource.CreateTask = s.dispatcher
 }
 
 // Run function returns all subdomains found with the service
-func (s *Source) CreateTask(domain string) core.Task {
+func (s *Source) dispatcher(domain string) core.Task {
 	task := core.Task{
 		Domain: domain,
 	}
 
-	randomApiKey := subscraping.PickRandom(s.apiKeys, s.Name())
-	if randomApiKey == "" {
-		return task
-	}
+	randomApiKey := s.BaseSource.GetRandomKey()
 	task.RequestOpts = &core.Options{
 		Method: http.MethodGet,
 		URL:    fmt.Sprintf("https://api.c99.nl/subdomainfinder?key=%s&domain=%s&json", randomApiKey, domain),
@@ -79,11 +64,9 @@ func (s *Source) CreateTask(domain string) core.Task {
 		if response.Error != "" {
 			return fmt.Errorf("%v", response.Error)
 		}
-
 		for _, data := range response.Subdomains {
 			if !strings.HasPrefix(data.Subdomain, ".") {
-				executor.Result <- core.Result{Source: s.Name(), Type: core.Subdomain, Value: data.Subdomain}
-				s.results++
+				executor.Result <- core.Result{Source: "c99", Type: core.Subdomain, Value: data.Subdomain}
 			}
 		}
 		return nil
@@ -109,14 +92,5 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = keys
-}
-
-func (s *Source) Statistics() subscraping.Statistics {
-	return subscraping.Statistics{
-		Errors:    s.errors,
-		Results:   s.results,
-		TimeTaken: s.timeTaken,
-		Skipped:   s.skipped,
-	}
+	s.BaseSource.AddKeys(keys...)
 }

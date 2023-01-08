@@ -9,11 +9,12 @@ import (
 	"strings"
 
 	"github.com/projectdiscovery/subfinder/v2/pkg/core"
+	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys []string
+	subscraping.BaseSource
 }
 
 type DnsRepoResponse []struct {
@@ -21,33 +22,24 @@ type DnsRepoResponse []struct {
 }
 
 // Source Daemon
-func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
-	ctxcancel, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	for {
-		select {
-		case <-ctxcancel.Done():
-			return
-		case domain, ok := <-e.Domain:
-			if !ok {
-				return
-			}
-			task := s.CreateTask(domain)
-			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
-			e.Task <- task
-		}
-	}
+func (s *Source) Daemon(ctx context.Context, e *core.Extractor, input <-chan string, output chan<- core.Task) {
+	s.BaseSource.Name = s.Name()
+	s.init()
+	s.BaseSource.Daemon(ctx, e, nil, input, output)
 }
 
-func (s *Source) CreateTask(domain string) core.Task {
+// inits the source before passing to daemon
+func (s *Source) init() {
+	s.BaseSource.RequiresKey = true
+	s.BaseSource.CreateTask = s.dispatcher
+}
+
+func (s *Source) dispatcher(domain string) core.Task {
 	task := core.Task{
 		Domain: domain,
 	}
-	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
-	if randomApiKey == "" {
-		return task
-	}
+	randomApiKey := s.BaseSource.GetRandomKey()
+
 	task.RequestOpts = &core.Options{
 		Method: http.MethodGet,
 		URL:    fmt.Sprintf("https://dnsrepo.noc.org/api/?apikey=%s&search=%s", randomApiKey, domain),
@@ -95,5 +87,5 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = keys
+	s.BaseSource.AddKeys(keys...)
 }

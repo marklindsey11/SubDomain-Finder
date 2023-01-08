@@ -9,6 +9,7 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/projectdiscovery/subfinder/v2/pkg/core"
+	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
 type hunterResp struct {
@@ -32,44 +33,34 @@ type hunterData struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys []string
+	subscraping.BaseSource
 }
 
 // Source Daemon
-func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
-	ctxcancel, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	for {
-		select {
-		case <-ctxcancel.Done():
-			return
-		case domain, ok := <-e.Domain:
-			if !ok {
-				return
-			}
-			task := s.CreateTask(domain)
-			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
-			e.Task <- task
-		}
-	}
+func (s *Source) Daemon(ctx context.Context, e *core.Extractor, input <-chan string, output chan<- core.Task) {
+	s.BaseSource.Name = s.Name()
+	s.init()
+	s.BaseSource.Daemon(ctx, e, nil, input, output)
 }
 
-func (s *Source) CreateTask(domain string) core.Task {
+// inits the source before passing to daemon
+func (s *Source) init() {
+	s.BaseSource.RequiresKey = true
+	s.BaseSource.CreateTask = s.dispatcher
+}
+
+func (s *Source) dispatcher(domain string) core.Task {
 	task := core.Task{
 		Domain: domain,
 	}
-	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
-	if randomApiKey == "" {
-		return task
-	}
+	randomApiKey := s.GetRandomKey()
 
 	// hunter api doc https://hunter.qianxin.com/home/helpCenter?r=5-1-2
 	qbase64 := base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("domain=\"%s\"", domain)))
 	page := 1
 	task.RequestOpts = &core.Options{
 		Method: http.MethodGet,
-		URL:    fmt.Sprintf("https://hunter.qianxin.com/openApi/search?api-key=%s&search=%s&page=%s&page_size=100&is_web=3", randomApiKey, qbase64, page),
+		URL:    fmt.Sprintf("https://hunter.qianxin.com/openApi/search?api-key=%s&search=%s&page=%v&page_size=100&is_web=3", randomApiKey, qbase64, page),
 		Source: "hunter",
 		UID:    randomApiKey,
 	}
@@ -96,7 +87,8 @@ func (s *Source) CreateTask(domain string) core.Task {
 				defer wg.Done()
 				for i := 2; i < pages; i++ {
 					tx := t.Clone()
-					tx.RequestOpts.URL = fmt.Sprintf("https://hunter.qianxin.com/openApi/search?api-key=%s&search=%s&page=%s&page_size=100&is_web=3", randomApiKey, qbase64, page)
+					randomApiKey := s.GetRandomKey()
+					tx.RequestOpts.URL = fmt.Sprintf("https://hunter.qianxin.com/openApi/search?api-key=%s&search=%s&page=%v&page_size=100&is_web=3", randomApiKey, qbase64, page)
 					executor.Task <- task
 				}
 			})
@@ -124,5 +116,5 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = keys
+	s.BaseSource.AddKeys(keys...)
 }

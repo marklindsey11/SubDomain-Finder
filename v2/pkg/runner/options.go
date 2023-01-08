@@ -43,6 +43,7 @@ type Options struct {
 	All                bool                // All specifies whether to use all (slow) sources.
 	Statistics         bool                // Statistics specifies whether to report source statistics
 	Threads            int                 // Threads controls the number of threads to use for active enumerations
+	Concurrency        int                 // HTTP Request Concurrency
 	Timeout            int                 // Timeout is the seconds to wait for sources to respond
 	MaxEnumerationTime int                 // MaxEnumerationTime is the maximum amount of time in minutes to wait for enumeration
 	Domain             goflags.StringSlice // Domain is the domain to find subdomains for
@@ -112,6 +113,7 @@ func ParseOptions() *Options {
 	createGroup(flagSet, "rate-limit", "Rate-limit",
 		flagSet.IntVarP(&options.RateLimit, "rate-limit-minute", "rlm", 0, "max number of http request sent to unknown ratelimit sources per minute"),
 		flagSet.IntVar(&options.Threads, "t", 10, "number of concurrent goroutines for resolving (-active only)"),
+		flagSet.IntVarP(&options.Concurrency, "concurrency", "c", 50, "Max number of requests to be sent in parallel"),
 	)
 
 	createGroup(flagSet, "output", "Output",

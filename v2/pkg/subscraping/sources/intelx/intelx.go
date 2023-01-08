@@ -12,6 +12,7 @@ import (
 
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/subfinder/v2/pkg/core"
+	"github.com/projectdiscovery/subfinder/v2/pkg/subscraping"
 )
 
 type searchResponseType struct {
@@ -39,43 +40,30 @@ type requestBody struct {
 
 // Source is the passive scraping agent
 type Source struct {
-	apiKeys []apiKey
-}
-
-type apiKey struct {
-	host string
-	key  string
+	subscraping.BaseSource
 }
 
 // Source Daemon
-func (s *Source) Daemon(ctx context.Context, e *core.Executor) {
-	ctxcancel, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	for {
-		select {
-		case <-ctxcancel.Done():
-			return
-		case domain, ok := <-e.Domain:
-			if !ok {
-				return
-			}
-			task := s.CreateTask(domain)
-			task.RequestOpts.Cancel = cancel // Option to cancel source under certain conditions (ex: ratelimit)
-			e.Task <- task
-		}
-	}
+func (s *Source) Daemon(ctx context.Context, e *core.Extractor, input <-chan string, output chan<- core.Task) {
+	s.BaseSource.Name = s.Name()
+	s.init()
+	s.BaseSource.Daemon(ctx, e, nil, input, output)
 }
 
-func (s *Source) CreateTask(domain string) core.Task {
+// inits the source before passing to daemon
+func (s *Source) init() {
+	s.BaseSource.RequiresKey = true
+	s.BaseSource.CreateTask = s.dispatcher
+}
+
+func (s *Source) dispatcher(domain string) core.Task {
 	task := core.Task{
 		Domain: domain,
 	}
-	randomApiKey := core.PickRandom(s.apiKeys, s.Name())
-	if randomApiKey.host == "" || randomApiKey.key == "" {
-		return task
-	}
-	searchURL := fmt.Sprintf("https://%s/phonebook/search?k=%s", randomApiKey.host, randomApiKey.key)
+
+	apihost, apikey, _ := subscraping.GetMultiPartKey(s.GetRandomKey())
+
+	searchURL := fmt.Sprintf("https://%s/phonebook/search?k=%s", apihost, apikey)
 	reqBody := requestBody{
 		Term:       domain,
 		Maxresults: 100000,
@@ -94,7 +82,7 @@ func (s *Source) CreateTask(domain string) core.Task {
 		ContentType: "application/json",
 		Body:        bytes.NewBuffer(body),
 		Source:      "intelx",
-		UID:         randomApiKey.key,
+		UID:         apikey,
 	}
 
 	task.OnResponse = func(t *core.Task, resp *http.Response, executor *core.Executor) error {
@@ -108,8 +96,9 @@ func (s *Source) CreateTask(domain string) core.Task {
 			return nil
 		}
 
+		apihost, apikey, _ := subscraping.GetMultiPartKey(s.GetRandomKey())
 		// fetch responses of seach results
-		resultsURL := fmt.Sprintf("https://%s/phonebook/search/result?k=%s&id=%s&limit=10000", randomApiKey.host, randomApiKey.key, response.ID)
+		resultsURL := fmt.Sprintf("https://%s/phonebook/search/result?k=%s&id=%s&limit=10000", apihost, apikey, response.ID)
 		tx := core.Task{
 			Domain: domain,
 		}
@@ -118,7 +107,7 @@ func (s *Source) CreateTask(domain string) core.Task {
 			Method: http.MethodGet,
 			URL:    resultsURL,
 			Source: "intelx",
-			UID:    randomApiKey.key,
+			UID:    apikey,
 		}
 
 		// Note Has recursion
@@ -166,7 +155,5 @@ func (s *Source) NeedsKey() bool {
 }
 
 func (s *Source) AddApiKeys(keys []string) {
-	s.apiKeys = core.CreateApiKeys(keys, func(k, v string) apiKey {
-		return apiKey{k, v}
-	})
+	s.AddKeys(keys...)
 }
